@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LWOS Connect</string>
+    <string name="status_starting">Starting…</string>
+    <string name="status_watching">Watching for nearby LWOS devices</string>
+    <string name="status_permissions_denied">Some permissions were denied — Bluetooth discovery will not work</string>
+    <string name="nearby_devices_header">Nearby devices (tap a trusted one to Continue On)</string>
+    <string name="no_devices_found">No LWOS devices found yet…</string>
+    <string name="received_handoffs_header">Received handoffs</string>
+</resources>
