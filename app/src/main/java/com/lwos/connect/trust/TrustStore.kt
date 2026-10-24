@@ -3,6 +3,7 @@ package com.lwos.connect.trust
 import android.content.Context
 import android.content.SharedPreferences
 import com.lwos.connect.model.TrustedDevice
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
