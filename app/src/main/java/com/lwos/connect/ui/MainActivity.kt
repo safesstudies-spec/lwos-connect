@@ -1,16 +1,21 @@
 package com.lwos.connect.ui
 
 import android.Manifest
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.database.Cursor
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.provider.OpenableColumns
 import android.view.Gravity
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -24,7 +29,7 @@ import com.lwos.connect.service.ContinuityService
 import com.lwos.connect.transport.ContinuityServer
 
 /**
- * Demo / control screen for LWOS Connect.
+ * Control screen for LWOS Connect.
  *
  * This is intentionally a thin shell: all the real work (discovery,
  * trust, sending/receiving) lives in ContinuityService so it keeps
@@ -34,15 +39,32 @@ import com.lwos.connect.transport.ContinuityServer
  *   3. Shows discovered devices and lets you tap one to pair or to fire
  *      a demo "Continue On" handoff (standing in for a real app's state
  *      until other LWOS apps register their own appId handlers).
- *   4. Shows a log of handoffs received from other devices.
+ *   4. Watches the clipboard WHILE VISIBLE and pushes changes to paired
+ *      devices — this has to live here rather than in the background
+ *      service, because Android 10+ only lets the app with current
+ *      foreground focus read clipboard content; a background Service
+ *      can still *write* the clipboard (used when a remote update comes
+ *      in) but can't reliably *read* it.
+ *   5. Lets you send a file to a paired device, and deep-links to the
+ *      system settings screen for granting notification-mirroring
+ *      access (which Android doesn't offer via a normal permission
+ *      dialog).
+ *   6. Shows a log of everything received from other devices.
  */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var deviceAdapter: DeviceListAdapter
+    private lateinit var clipboardManager: ClipboardManager
 
     private var service: ContinuityService? = null
     private var isBound = false
+
+    private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
+        onLocalClipboardChanged()
+    }
+
+    private var pendingFileSendUri: Uri? = null
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -54,6 +76,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val filePickerLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            pendingFileSendUri = uri
+            promptForFileDestination(uri)
+        }
+    }
+
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             service = (binder as ContinuityService.LocalBinder).getService()
@@ -61,7 +92,19 @@ class MainActivity : AppCompatActivity() {
 
             service?.onDeviceListChanged = { runOnUiThread { refreshDeviceList() } }
             service?.onHandoffReceived = { packet ->
-                runOnUiThread { appendHandoffLog(packet.appDisplayName, packet.sourceDeviceName) }
+                runOnUiThread { appendActivityLog("Continue On from ${packet.sourceDeviceName}: ${packet.appDisplayName}") }
+            }
+            service?.onClipboardReceived = { text, fromDeviceName ->
+                runOnUiThread { appendActivityLog("Clipboard from $fromDeviceName: ${text.take(60)}") }
+            }
+            service?.onNotificationReceived = { appLabel, title, text, fromDeviceName ->
+                runOnUiThread {
+                    val summary = listOfNotNull(title, text).joinToString(" — ")
+                    appendActivityLog("[$fromDeviceName] $appLabel: $summary")
+                }
+            }
+            service?.onFileReceived = { fileName, sizeBytes, fromDeviceName ->
+                runOnUiThread { appendActivityLog("File from $fromDeviceName: $fileName (${sizeBytes / 1024} KB) saved to Downloads/LWOSConnect") }
             }
             refreshDeviceList()
         }
@@ -76,6 +119,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
 
         deviceAdapter = DeviceListAdapter(
             onSendContinueOn = ::onSendContinueOnTapped,
@@ -85,8 +129,25 @@ class MainActivity : AppCompatActivity() {
         binding.deviceList.adapter = deviceAdapter
 
         binding.addManualDeviceButton.setOnClickListener { showManualDeviceDialog() }
+        binding.sendFileButton.setOnClickListener { filePickerLauncher.launch(arrayOf("*/*")) }
+        binding.enableNotificationMirrorButton.setOnClickListener {
+            service?.openNotificationAccessSettings()
+                ?: Toast.makeText(this, "Service not ready yet", Toast.LENGTH_SHORT).show()
+        }
 
         requestNeededPermissions()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Only register while this screen is actually visible — see the
+        // class doc for why that's required, not just a convenience.
+        clipboardManager.addPrimaryClipChangedListener(clipboardListener)
+    }
+
+    override fun onPause() {
+        clipboardManager.removePrimaryClipChangedListener(clipboardListener)
+        super.onPause()
     }
 
     override fun onDestroy() {
@@ -131,6 +192,25 @@ class MainActivity : AppCompatActivity() {
         deviceAdapter.submitList(devices)
         binding.emptyStateText.visibility =
             if (devices.isEmpty()) android.view.View.VISIBLE else android.view.View.GONE
+    }
+
+    /**
+     * Fires whenever the clipboard changes WHILE this Activity is
+     * resumed. Two things can cause that: the user genuinely copying
+     * something, or us having just applied a remote CLIPBOARD_SYNC to
+     * the local clipboard (which immediately re-triggers this same
+     * listener). consumeClipboardEchoGuard tells the two apart.
+     */
+    private fun onLocalClipboardChanged() {
+        val clip = clipboardManager.primaryClip ?: return
+        if (clip.itemCount == 0) return
+        val text = clip.getItemAt(0).coerceToText(this)?.toString()
+        if (text.isNullOrBlank()) return
+
+        val svc = service ?: return
+        if (svc.consumeClipboardEchoGuard(text)) return // this is an echo of what we just received, don't resend
+
+        svc.broadcastClipboard(text)
     }
 
     /**
@@ -200,8 +280,50 @@ class MainActivity : AppCompatActivity() {
         binding.statusText.text = "Sent Continue On to ${device.deviceName}"
     }
 
-    private fun appendHandoffLog(appName: String, fromDevice: String) {
+    /** Asks which trusted device to send the just-picked file to, then sends it. */
+    private fun promptForFileDestination(uri: Uri) {
+        val trusted = service?.discoveredDevices?.values?.filter { it.isTrusted } ?: emptyList()
+        if (trusted.isEmpty()) {
+            Toast.makeText(this, R.string.no_trusted_devices, Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val fileName = queryDisplayName(uri) ?: "shared_file"
+
+        if (trusted.size == 1) {
+            sendFileTo(trusted.first(), uri, fileName)
+            return
+        }
+
+        val names = trusted.map { it.deviceName }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle(R.string.choose_device_dialog_title)
+            .setItems(names) { _, index -> sendFileTo(trusted[index], uri, fileName) }
+            .show()
+    }
+
+    private fun sendFileTo(device: DiscoveredDevice, uri: Uri, fileName: String) {
+        service?.sendFile(device, uri, fileName)
+        binding.statusText.text = "Sending $fileName to ${device.deviceName}…"
+    }
+
+    private fun queryDisplayName(uri: Uri): String? {
+        var cursor: Cursor? = null
+        return try {
+            cursor = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            if (cursor != null && cursor.moveToFirst()) {
+                val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (index >= 0) cursor.getString(index) else null
+            } else {
+                null
+            }
+        } finally {
+            cursor?.close()
+        }
+    }
+
+    private fun appendActivityLog(line: String) {
         val current = binding.handoffLog.text
-        binding.handoffLog.text = "Continue On from $fromDevice: $appName\n$current"
+        binding.handoffLog.text = "$line\n$current"
     }
 }

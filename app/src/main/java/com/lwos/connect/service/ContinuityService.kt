@@ -4,7 +4,10 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
+import android.net.Uri
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -18,9 +21,11 @@ import com.lwos.connect.model.DeviceType
 import com.lwos.connect.model.DiscoveredDevice
 import com.lwos.connect.model.LinkType
 import com.lwos.connect.model.TrustedDevice
-import com.lwos.connect.trust.TrustStore
 import com.lwos.connect.transport.ContinuityClient
 import com.lwos.connect.transport.ContinuityServer
+import com.lwos.connect.transport.FileTransferClient
+import com.lwos.connect.transport.FileTransferServer
+import com.lwos.connect.trust.TrustStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -31,12 +36,13 @@ import java.util.concurrent.atomic.AtomicLong
  * The always-on piece of LWOS Connect. Runs as a foreground service so
  * Android doesn't kill it, and owns:
  *   - LAN + Bluetooth discovery (who else is around)
- *   - the continuity server (accepting handoffs/pairing from peers)
- *   - the trust store (who we're allowed to accept handoffs from)
+ *   - the continuity server (accepting handoffs/pairing/clipboard/
+ *     notifications from peers) and the file-transfer server
+ *   - the trust store (who we're allowed to accept things from)
  *
- * MainActivity binds to this to show what's discovered and to trigger a
- * "Continue On" send; this service keeps running even if the UI isn't
- * open, since a handoff can arrive at any time.
+ * MainActivity binds to this to show what's discovered and to trigger
+ * actions; this service keeps running even if the UI isn't open, since
+ * any of the above can arrive at any time.
  */
 class ContinuityService : Service() {
 
@@ -46,6 +52,7 @@ class ContinuityService : Service() {
 
     private lateinit var trustStore: TrustStore
     private lateinit var continuityServer: ContinuityServer
+    private lateinit var fileTransferServer: FileTransferServer
     private var lanDiscovery: LanDiscoveryManager? = null
     private var bluetoothDiscovery: BluetoothDiscoveryManager? = null
 
@@ -56,6 +63,36 @@ class ContinuityService : Service() {
 
     var onDeviceListChanged: (() -> Unit)? = null
     var onHandoffReceived: ((ContinuityPacket) -> Unit)? = null
+    var onClipboardReceived: ((text: String, fromDeviceName: String) -> Unit)? = null
+    var onNotificationReceived: ((appLabel: String, title: String?, text: String?, fromDeviceName: String) -> Unit)? = null
+    var onFileReceived: ((fileName: String, sizeBytes: Long, fromDeviceName: String) -> Unit)? = null
+
+    // Guards against the clipboard-sync echo loop: when we apply a
+    // remote clipboard update locally, Android's own clipboard listener
+    // (registered in MainActivity, since reading the clipboard requires
+    // foreground focus on modern Android) would otherwise see "the
+    // clipboard changed" and immediately broadcast it right back out.
+    // One-shot by design (see consumeClipboardEchoGuard): if it stayed
+    // set, copying the exact same text twice in a row for real would get
+    // silently swallowed the second time.
+    @Volatile
+    private var lastAppliedRemoteClipboardText: String? = null
+
+    /**
+     * Called by MainActivity's clipboard listener right after it reads a
+     * newly-changed clipboard value. Returns true (and clears the guard)
+     * if this value is exactly the one we just wrote ourselves because a
+     * CLIPBOARD_SYNC came in — meaning MainActivity should NOT broadcast
+     * it back out, since that would just echo it forever between devices.
+     */
+    fun consumeClipboardEchoGuard(candidateText: String): Boolean {
+        return if (lastAppliedRemoteClipboardText == candidateText) {
+            lastAppliedRemoteClipboardText = null
+            true
+        } else {
+            false
+        }
+    }
 
     inner class LocalBinder : Binder() {
         fun getService(): ContinuityService = this@ContinuityService
@@ -65,6 +102,7 @@ class ContinuityService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         trustStore = TrustStore(this)
 
         startForeground(NOTIFICATION_ID, buildNotification())
@@ -73,6 +111,11 @@ class ContinuityService : Service() {
             handleIncomingMessage(message, fromHost)
         }
         continuityServer.start()
+
+        fileTransferServer = FileTransferServer(this, FileTransferServer.DEFAULT_PORT) { fileName, sizeBytes, fromDeviceName ->
+            onFileReceived?.invoke(fileName, sizeBytes, fromDeviceName)
+        }
+        fileTransferServer.start()
 
         lanDiscovery = LanDiscoveryManager(
             context = this,
@@ -103,9 +146,11 @@ class ContinuityService : Service() {
 
     override fun onDestroy() {
         continuityServer.stop()
+        fileTransferServer.stop()
         lanDiscovery?.stop()
         bluetoothDiscovery?.stopDiscovery()
         scope.coroutineContext[Job]?.cancel()
+        if (instance === this) instance = null
         super.onDestroy()
     }
 
@@ -168,6 +213,60 @@ class ContinuityService : Service() {
         }
     }
 
+    /**
+     * Pushes [text] to every currently-trusted, reachable device.
+     *
+     * Called from MainActivity (not triggered from inside this service)
+     * because reading the clipboard on Android 10+ requires the calling
+     * app to have foreground focus — a background Service generally
+     * cannot read clipboard *content*, only an Activity that's actually
+     * on screen can. Writing a received value back to the clipboard has
+     * no such restriction, so applying incoming CLIPBOARD_SYNC messages
+     * still happens here, in the background, in handleIncomingMessage.
+     */
+    fun broadcastClipboard(text: String) {
+        lastAppliedRemoteClipboardText = null // this is an outbound (locally-copied) value, not an echo
+        val message = ContinuityMessage.clipboardSync(localDeviceId(), text)
+        broadcastToTrustedDevices(message)
+    }
+
+    fun broadcastNotification(appLabel: String, title: String?, text: String?) {
+        val message = ContinuityMessage.notificationMirror(localDeviceId(), appLabel, title, text)
+        broadcastToTrustedDevices(message)
+    }
+
+    private fun broadcastToTrustedDevices(message: ContinuityMessage) {
+        val targets = discoveredDevices.values.filter { it.isTrusted && it.host != null && it.port != null }
+        if (targets.isEmpty()) return
+        scope.launch {
+            for (device in targets) {
+                ContinuityClient.send(device.host!!, device.port!!, message)
+            }
+        }
+    }
+
+    /** Sends a file to a trusted device's FileTransferServer. */
+    fun sendFile(device: DiscoveredDevice, uri: Uri, fileName: String) {
+        if (device.host == null) return
+        scope.launch {
+            FileTransferClient.sendFile(
+                context = this@ContinuityService,
+                uri = uri,
+                fileName = fileName,
+                host = device.host,
+                port = FileTransferServer.DEFAULT_PORT,
+                senderDeviceId = localDeviceId(),
+                senderDeviceName = Build.MODEL ?: "LWOS Device"
+            )
+        }
+    }
+
+    fun openNotificationAccessSettings() {
+        val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        startActivity(intent)
+    }
+
     // --- Internal ------------------------------------------------------------
 
     private fun handleIncomingMessage(message: ContinuityMessage, fromHost: String) {
@@ -183,26 +282,108 @@ class ContinuityService : Service() {
             }
 
             ContinuityMessage.MessageType.PAIR_REQUEST -> {
-                // In a full implementation this would surface a UI prompt
-                // ("Device X wants to pair — codes match? Y/N"). For this
-                // first pass we auto-accept and record trust, since the
-                // pairing *code* (shown on both screens out-of-band) is
-                // already the human verification step.
+                // Trust the requester, AND send our own identity back so
+                // pairing becomes mutual. Before this fix, only the
+                // receiving side ever trusted anyone — the device that
+                // tapped "Pair" never got trusted back, so it still
+                // showed the peer as a stranger afterwards. That's what
+                // made pairing look broken even when it had "worked".
                 val deviceId = message.deviceId ?: return
                 val deviceName = message.deviceName ?: deviceId
                 val deviceType = message.deviceType ?: DeviceType.PHONE.name
-                trustStore.trust(
-                    TrustedDevice(
-                        deviceId = deviceId,
-                        deviceName = deviceName,
-                        deviceType = deviceType,
-                        pairedAtEpochMs = System.currentTimeMillis()
+                trustStore.trust(TrustedDevice(deviceId, deviceName, deviceType, System.currentTimeMillis()))
+                upgradeDeviceIdentity(fromHost, deviceId, deviceName, deviceType)
+
+                scope.launch {
+                    val response = ContinuityMessage.pairResponse(
+                        deviceId = localDeviceId(),
+                        deviceName = Build.MODEL ?: "LWOS Device",
+                        deviceType = DeviceType.PHONE.name,
+                        accepted = true
                     )
+                    // Reply on a FRESH connection to the requester's own
+                    // listening port — by the time we're handling this,
+                    // the requester already closed the connection it used
+                    // to send PAIR_REQUEST (see ContinuityClient: every
+                    // message is a short-lived connect/send/close).
+                    ContinuityClient.send(fromHost, ContinuityServer.DEFAULT_PORT, response)
+                }
+            }
+
+            ContinuityMessage.MessageType.PAIR_RESPONSE -> {
+                if (message.accepted != true) return
+                val deviceId = message.deviceId ?: return
+                val deviceName = message.deviceName ?: deviceId
+                val deviceType = message.deviceType ?: DeviceType.PC.name
+                trustStore.trust(TrustedDevice(deviceId, deviceName, deviceType, System.currentTimeMillis()))
+                upgradeDeviceIdentity(fromHost, deviceId, deviceName, deviceType)
+            }
+
+            ContinuityMessage.MessageType.CLIPBOARD_SYNC -> {
+                val sourceId = message.deviceId ?: return
+                val text = message.clipboardText ?: return
+                if (!trustStore.isTrusted(sourceId)) return
+
+                lastAppliedRemoteClipboardText = text
+                val clipboardManager = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                clipboardManager.setPrimaryClip(ClipData.newPlainText("LWOS Connect", text))
+
+                val fromName = discoveredDevices[sourceId]?.deviceName ?: sourceId
+                onClipboardReceived?.invoke(text, fromName)
+            }
+
+            ContinuityMessage.MessageType.NOTIFICATION_MIRROR -> {
+                val sourceId = message.deviceId ?: return
+                if (!trustStore.isTrusted(sourceId)) return
+                val fromName = discoveredDevices[sourceId]?.deviceName ?: sourceId
+                onNotificationReceived?.invoke(
+                    message.notifAppLabel ?: "Unknown app",
+                    message.notifTitle,
+                    message.notifText,
+                    fromName
                 )
             }
 
             else -> { /* heartbeat / acks: nothing to do yet */ }
         }
+    }
+
+    /**
+     * Once we learn a peer's real, stable deviceId (from a pairing
+     * message), replace whatever temporary entry we had for its address
+     * — a manually-added "manual-host:port" entry, or a freshly
+     * discovered one — with a single entry keyed by that real id and
+     * marked trusted. Without this, a manually-added device would never
+     * visibly become "trusted" in the device list: the trust store would
+     * hold the real id, but the list entry would still be keyed by the
+     * fake manual id, so the isTrusted lookup would never match.
+     */
+    private fun upgradeDeviceIdentity(host: String, realDeviceId: String, realDeviceName: String, realDeviceTypeRaw: String) {
+        val realDeviceType = try {
+            DeviceType.valueOf(realDeviceTypeRaw)
+        } catch (e: IllegalArgumentException) {
+            DeviceType.PC
+        }
+
+        val staleEntry = discoveredDevices.entries.find { it.value.host == host && it.key != realDeviceId }
+        if (staleEntry != null) discoveredDevices.remove(staleEntry.key)
+
+        val base = staleEntry?.value ?: DiscoveredDevice(
+            deviceId = realDeviceId,
+            deviceName = realDeviceName,
+            deviceType = realDeviceType,
+            linkType = LinkType.LAN,
+            host = host,
+            port = ContinuityServer.DEFAULT_PORT
+        )
+
+        discoveredDevices[realDeviceId] = base.copy(
+            deviceId = realDeviceId,
+            deviceName = realDeviceName,
+            deviceType = realDeviceType,
+            isTrusted = true
+        )
+        onDeviceListChanged?.invoke()
     }
 
     private fun addOrUpdateDevice(device: DiscoveredDevice) {
@@ -236,5 +417,16 @@ class ContinuityService : Service() {
     companion object {
         private const val CHANNEL_ID = "lwos_continuity_channel"
         private const val NOTIFICATION_ID = 1001
+
+        /**
+         * Lets NotificationMirrorListenerService (a *separate* Android
+         * Service with no other way to reach this one) hand off
+         * notifications to broadcast. A singleton is a blunt tool, but
+         * there's only ever one ContinuityService instance in this
+         * process, and the alternative (binding one service to another)
+         * is substantially more ceremony for the same result.
+         */
+        var instance: ContinuityService? = null
+            private set
     }
 }

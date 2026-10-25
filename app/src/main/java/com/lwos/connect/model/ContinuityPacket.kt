@@ -54,10 +54,22 @@ data class ContinuityMessage(
     val deviceId: String? = null,
     val epochMs: Long? = null,
 
-    // Present when type == PAIR_REQUEST
+    // Present when type == PAIR_REQUEST (identity of the device asking to
+    // pair) AND when type == PAIR_RESPONSE (identity of the device that's
+    // accepting — pairing only becomes mutual because BOTH messages carry
+    // a full identity, so whichever side receives either one can trust
+    // the sender back. See ContinuityService.handleIncomingMessage.)
     val deviceName: String? = null,
-    val deviceType: String? = null, // "phone" | "tablet" | "pc"
-    val pairingCode: String? = null
+    val deviceType: String? = null, // "PHONE" | "TABLET" | "PC"
+    val pairingCode: String? = null,
+
+    // Present when type == CLIPBOARD_SYNC
+    val clipboardText: String? = null,
+
+    // Present when type == NOTIFICATION_MIRROR
+    val notifAppLabel: String? = null,
+    val notifTitle: String? = null,
+    val notifText: String? = null
 ) {
     @Serializable
     enum class MessageType {
@@ -65,7 +77,9 @@ data class ContinuityMessage(
         HANDOFF_ACK,
         HEARTBEAT,
         PAIR_REQUEST,
-        PAIR_RESPONSE
+        PAIR_RESPONSE,
+        CLIPBOARD_SYNC,
+        NOTIFICATION_MIRROR
     }
 
     companion object {
@@ -87,7 +101,32 @@ data class ContinuityMessage(
                 pairingCode = pairingCode
             )
 
-        fun pairResponse(deviceId: String, accepted: Boolean) =
-            ContinuityMessage(type = MessageType.PAIR_RESPONSE, deviceId = deviceId, accepted = accepted)
+        /**
+         * Sent back by whoever received a PAIR_REQUEST, carrying ITS OWN
+         * identity (not the requester's) so the original requester can
+         * trust the responder too. Without this, pairing is one-directional:
+         * the requester trusts nobody back, which is exactly the bug that
+         * made pairing feel broken.
+         */
+        fun pairResponse(deviceId: String, deviceName: String, deviceType: String, accepted: Boolean) =
+            ContinuityMessage(
+                type = MessageType.PAIR_RESPONSE,
+                deviceId = deviceId,
+                deviceName = deviceName,
+                deviceType = deviceType,
+                accepted = accepted
+            )
+
+        fun clipboardSync(sourceDeviceId: String, text: String) =
+            ContinuityMessage(type = MessageType.CLIPBOARD_SYNC, deviceId = sourceDeviceId, clipboardText = text)
+
+        fun notificationMirror(sourceDeviceId: String, appLabel: String, title: String?, text: String?) =
+            ContinuityMessage(
+                type = MessageType.NOTIFICATION_MIRROR,
+                deviceId = sourceDeviceId,
+                notifAppLabel = appLabel,
+                notifTitle = title,
+                notifText = text
+            )
     }
 }
