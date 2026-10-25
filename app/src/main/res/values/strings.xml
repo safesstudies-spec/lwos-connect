@@ -7,4 +7,8 @@
     <string name="nearby_devices_header">Nearby devices (tap a trusted one to Continue On)</string>
     <string name="no_devices_found">No LWOS devices found yet…</string>
     <string name="received_handoffs_header">Received handoffs</string>
+    <string name="add_device_manually">Add device manually (by IP)</string>
+    <string name="manual_device_dialog_title">Connect by IP</string>
+    <string name="manual_device_ip_hint">IP address (e.g. 192.168.49.1)</string>
+    <string name="manual_device_name_hint">Name (optional, e.g. Laptop)</string>
 </resources>

@@ -8,6 +8,9 @@ import android.content.ServiceConnection
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.view.Gravity
+import android.widget.EditText
+import android.widget.LinearLayout
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -18,6 +21,7 @@ import com.lwos.connect.R
 import com.lwos.connect.databinding.ActivityMainBinding
 import com.lwos.connect.model.DiscoveredDevice
 import com.lwos.connect.service.ContinuityService
+import com.lwos.connect.transport.ContinuityServer
 
 /**
  * Demo / control screen for LWOS Connect.
@@ -80,6 +84,8 @@ class MainActivity : AppCompatActivity() {
         binding.deviceList.layoutManager = LinearLayoutManager(this)
         binding.deviceList.adapter = deviceAdapter
 
+        binding.addManualDeviceButton.setOnClickListener { showManualDeviceDialog() }
+
         requestNeededPermissions()
     }
 
@@ -125,6 +131,49 @@ class MainActivity : AppCompatActivity() {
         deviceAdapter.submitList(devices)
         binding.emptyStateText.visibility =
             if (devices.isEmpty()) android.view.View.VISIBLE else android.view.View.GONE
+    }
+
+    /**
+     * Lets you add a device by typing its IP directly, for when mDNS
+     * discovery doesn't find it — e.g. over a phone hotspot, where
+     * multicast (what discovery relies on) is often unreliable even
+     * though a direct connection to the IP works fine.
+     */
+    private fun showManualDeviceDialog() {
+        val padding = (16 * resources.displayMetrics.density).toInt()
+
+        val ipInput = EditText(this).apply {
+            hint = getString(R.string.manual_device_ip_hint)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+        }
+        val nameInput = EditText(this).apply {
+            hint = getString(R.string.manual_device_name_hint)
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(padding, padding, padding, padding)
+            gravity = Gravity.CENTER_HORIZONTAL
+            addView(ipInput)
+            addView(nameInput)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.manual_device_dialog_title)
+            .setView(container)
+            .setPositiveButton("Add") { _, _ ->
+                val ip = ipInput.text.toString().trim()
+                if (ip.isNotEmpty()) {
+                    service?.addManualDevice(
+                        host = ip,
+                        port = ContinuityServer.DEFAULT_PORT,
+                        displayName = nameInput.text.toString().trim()
+                    )
+                    refreshDeviceList()
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
     }
 
     private fun onPairTapped(device: DiscoveredDevice) {

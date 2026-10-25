@@ -8,12 +8,15 @@ This is deliberately small: it speaks the exact same newline-delimited
 JSON protocol as the Android app's ContinuityServer/ContinuityClient
 (see app/src/main/java/com/lwos/connect/transport/ and model/
 ContinuityPacket.kt), so the two sides can already talk to each other
-today. What it does NOT do yet, and what later passes should add:
+today. It also now advertises itself over mDNS (via the `zeroconf`
+package) on the same `_lwosconnect._tcp.` service type the Android
+app's LanDiscoveryManager looks for, so the phone can find this
+machine automatically instead of needing a typed-in IP.
 
-  - mDNS advertising on the LAN (so phones discover the PC automatically
-    instead of needing a typed-in IP). On Linux this is normally done via
-    Avahi (`python-zeroconf` or shelling out to `avahi-publish-service`).
-  - Real trust/pairing persistence (currently an in-memory set).
+What it still does NOT do, and what later passes should add:
+
+  - Real trust/pairing persistence (currently an in-memory set, reset
+    every time you restart this script).
   - Actually resuming an app's state from stateBlob — right now it just
     prints what it received. Once you decide which first app on LWOS
     Desktop should support Continue On (e.g. a browser, a notes app),
@@ -22,6 +25,7 @@ today. What it does NOT do yet, and what later passes should add:
     path (BlueZ via `bluezero` or D-Bus).
 
 Run it with:
+    pip3 install --user zeroconf   # one-time
     python3 lwos_continuity_daemon.py
 
 Matches ContinuityServer.DEFAULT_PORT on the Android side (59213).
@@ -30,11 +34,13 @@ Matches ContinuityServer.DEFAULT_PORT on the Android side (59213).
 import json
 import socket
 import socketserver
-import threading
-import time
+import uuid
 from dataclasses import dataclass, field
 
+from zeroconf import ServiceInfo, Zeroconf
+
 DEFAULT_PORT = 59213
+SERVICE_TYPE = "_lwosconnect._tcp.local."
 
 
 # --- Trust store (in-memory stand-in for TrustStore.kt) ---------------------
@@ -136,14 +142,69 @@ class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     daemon_threads = True
 
 
+def get_local_ip() -> str:
+    """
+    Finds this machine's LAN IP address (the one other devices on the
+    same Wi-Fi/hotspot would use to reach it) without needing any
+    actual internet connectivity — connecting a UDP socket doesn't
+    send any packets, it just asks the OS to pick the right outbound
+    interface, which we then read back.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def advertise(local_ip: str, device_id: str, device_name: str, port: int) -> tuple[Zeroconf, ServiceInfo]:
+    """
+    Broadcasts this machine over mDNS so the Android app's
+    LanDiscoveryManager (NsdManager-based) can find it automatically,
+    the same way it finds other LWOS Mobile devices.
+
+    The service name format ("LWOS-<name>-<id>") and the "deviceId"/
+    "deviceType" TXT attributes have to match what the Android side
+    expects to parse in LanDiscoveryManager.kt's onServiceResolved.
+    """
+    service_name = f"LWOS-{device_name}-{device_id}.{SERVICE_TYPE}"
+    info = ServiceInfo(
+        type_=SERVICE_TYPE,
+        name=service_name,
+        addresses=[socket.inet_aton(local_ip)],
+        port=port,
+        properties={
+            "deviceId": device_id,
+            "deviceType": "PC",
+        },
+    )
+    zc = Zeroconf()
+    zc.register_service(info)
+    print(f"Advertising as '{service_name}' at {local_ip}:{port}")
+    return zc, info
+
+
 def run(port: int = DEFAULT_PORT) -> None:
-    with ThreadingTCPServer(("0.0.0.0", port), ContinuityHandler) as server:
-        print(f"LWOS continuity daemon listening on 0.0.0.0:{port}")
-        print("Waiting for handoffs from paired LWOS Mobile devices...")
-        try:
-            server.serve_forever()
-        except KeyboardInterrupt:
-            print("\nShutting down.")
+    local_ip = get_local_ip()
+    device_id = f"lwos-desktop-{uuid.uuid5(uuid.NAMESPACE_DNS, socket.gethostname()).hex[:12]}"
+    device_name = socket.gethostname()
+
+    zc, info = advertise(local_ip, device_id, device_name, port)
+
+    try:
+        with ThreadingTCPServer(("0.0.0.0", port), ContinuityHandler) as server:
+            print(f"LWOS continuity daemon listening on 0.0.0.0:{port}")
+            print("Waiting for handoffs from paired LWOS Mobile devices...")
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                print("\nShutting down.")
+    finally:
+        zc.unregister_service(info)
+        zc.close()
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ import com.lwos.connect.model.ContinuityMessage
 import com.lwos.connect.model.ContinuityPacket
 import com.lwos.connect.model.DeviceType
 import com.lwos.connect.model.DiscoveredDevice
+import com.lwos.connect.model.LinkType
 import com.lwos.connect.model.TrustedDevice
 import com.lwos.connect.trust.TrustStore
 import com.lwos.connect.transport.ContinuityClient
@@ -109,6 +110,33 @@ class ContinuityService : Service() {
     }
 
     // --- Public API used by MainActivity -----------------------------------
+
+    /**
+     * Adds a device by its IP address directly, bypassing discovery.
+     *
+     * mDNS (what LanDiscoveryManager relies on) depends on multicast
+     * traffic, which a lot of Wi-Fi hotspots — phone hotspots especially
+     * — throttle or drop even when "client isolation" is off, so two
+     * devices can often reach each other directly by IP while still
+     * failing to *discover* each other automatically. This is the
+     * fallback for that: the user reads the PC's IP off its terminal
+     * (`ip addr show`) and types it in once.
+     *
+     * Re-adding the same host:port updates the existing entry instead of
+     * creating a duplicate, since deviceId is derived from the address.
+     */
+    fun addManualDevice(host: String, port: Int, displayName: String) {
+        addOrUpdateDevice(
+            DiscoveredDevice(
+                deviceId = "manual-$host:$port",
+                deviceName = displayName.ifBlank { host },
+                deviceType = DeviceType.PC,
+                linkType = LinkType.LAN,
+                host = host,
+                port = port
+            )
+        )
+    }
 
     fun pair(device: DiscoveredDevice, pairingCode: String) {
         scope.launch {
