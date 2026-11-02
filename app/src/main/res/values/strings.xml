@@ -15,4 +15,6 @@
     <string name="enable_notification_mirroring">Enable notification mirroring</string>
     <string name="no_trusted_devices">Pair a device first</string>
     <string name="choose_device_dialog_title">Send to which device?</string>
+    <string name="second_screen_usb">Second Screen (USB)</string>
+    <string name="second_screen_adb_missing">Plug in via USB, enable USB debugging, and make sure the daemon is running on the PC with adb installed</string>
 </resources>

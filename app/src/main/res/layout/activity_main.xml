@@ -56,6 +56,13 @@
 
     </LinearLayout>
 
+    <Button
+        android:id="@+id/secondScreenButton"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="@string/second_screen_usb" />
+
     <TextView
         android:id="@+id/emptyStateText"
         android:layout_width="match_parent"

@@ -3,13 +3,16 @@
 The cross-device companion app for LightningWeb OS: phone/tablet ↔ PC
 continuity. Built on top of **Continue On** (discovery, mutual
 pairing/trust, and handing off "what you're doing" from one device to
-another), this pass adds four more real, working features: **Universal
-Clipboard**, **Fast File Transfer**, **Notification Mirroring**, and a
-proper **mutual pairing handshake** (the bug where pairing "did
-something" but nothing actually synced afterward — fixed, see below).
+another), this app now also has: **Universal Clipboard**, **Fast File
+Transfer**, **Notification Mirroring**, a proper **mutual pairing
+handshake** (the bug where pairing "did something" but nothing
+actually synced afterward — fixed, see below), and **Second Screen
+(wired, mirror mode)** — turn the phone into a live USB-connected
+mirror of the PC's screen.
 See `ROADMAP.md` for the larger remaining features (Phone Call
-Movement, App/Storage Streaming, Second Screen, Multi-Control, Audio
-Switch, Universal Cast, Remote Camera, and the XCore gaming pillar).
+Movement, App/Storage Streaming, Multi-Control, Audio Switch,
+Universal Cast, Remote Camera, a true *extended* Second Screen, and
+the XCore gaming pillar).
 
 Per your answers: this ships as a **separate app** for now (a future
 pass folds the always-on parts into the LWOS Mobile launcher/OS itself
@@ -127,6 +130,43 @@ access. Once granted, titles/text of notifications from other apps get
 forwarded (text only — no actions, no images yet) to trusted devices
 and logged by the daemon.
 
+### Second Screen (wired, mirror mode)
+
+Tap **Second Screen (USB)** with the phone plugged into the PC, and it
+shows a live duplicate of whatever's on the PC's screen. No pairing or
+trust check needed here — a physical USB cable already is the trust
+boundary, same reasoning as any other adb-based tool.
+
+How the transport works: `adb reverse` is the whole trick. It makes
+the *phone's own* `127.0.0.1:<port>` forward over the USB cable to a
+real port on the PC — so the phone just connects to localhost and is
+actually talking to the PC, with adb handling every bit of the USB
+complexity. No custom USB protocol code anywhere in this app. The
+daemon applies this automatically (`run_adb_reverse_loop`): every few
+seconds it checks `adb devices` and runs `adb reverse` for all three
+of this app's ports (control, file transfer, second screen) against
+any connected, authorized device. This is exactly how
+[scrcpy](https://github.com/Genymobile/scrcpy) does its wired mode.
+
+How the video works: the daemon captures the PC's real X11 display
+with `ffmpeg -f x11grab`, encodes it to H.264 (`libx264`, baseline
+profile for the widest hardware-decoder compatibility, zero-latency
+tuning, no B-frames) and streams the raw encoded bytes straight to the
+phone — one small JSON line up front announcing the real resolution
+(auto-detected via `xrandr`), then a continuous raw stream, deliberately
+*not* wrapped in a container (no mp4/mkv muxing) since there's nothing
+here that needs seeking, only the lowest latency we can get. The phone
+splits that raw stream back into individual frames
+(`AnnexBNalSplitter`) and feeds them straight into `MediaCodec`,
+Android's hardware video decoder, rendering directly onto the screen.
+
+This is **mirror**, not a true extended desktop you could drag windows
+onto — it shows whatever's already on the PC's screen. See `ROADMAP.md`
+for what a real second-monitor mode needs on top of this (a virtual
+X11 display), and for wireless mode (same video pipeline, just reached
+over Wi-Fi instead of `adb reverse`). There's also no touch/mouse input
+back to the PC yet — display only.
+
 ## What's real vs. stubbed vs. roadmap
 
 | Piece | Status |
@@ -140,10 +180,15 @@ and logged by the daemon.
 | Universal Clipboard (phone/tablet → PC) | Real |
 | Fast File Transfer (phone/tablet → PC) | Real |
 | Notification Mirroring (phone/tablet → PC) | Real (text only) |
+| Second Screen — wired, mirror mode | Real |
+| `adb reverse` wired transport (auto-applied to all 3 ports) | Real |
 | Trust store on desktop daemon | **Stubbed** — in-memory, resets on restart |
 | mDNS advertising on desktop | **Not done** — use "Add device manually" with the PC's IP |
 | Pairing confirmation UX | **Stubbed** — fixed demo code (`482913`), auto-accepted, no generated code + explicit confirm dialog yet |
 | Clipboard/notifications/files **PC → phone** direction | **Not done** — current daemon can receive but has no equivalent of `ContinuityClient`/`FileTransferClient` to initiate a send back |
+| Second Screen — wireless mode | **Not done** — same video pipeline, needs a non-adb transport (LAN) wired in |
+| Second Screen — true extended desktop | **Not done** — needs a virtual X11 output on the PC; mirror only for now |
+| Second Screen — touch/mouse input back to PC | **Not done** — display only, no input yet |
 | Actual Continue On "resume" behavior | **Stubbed** — logs what it received; no real app on either side knows how to resume from a `stateBlob` yet |
 | Everything else (Phone Call Movement, App/Storage Streaming, Multi-Control, Audio Switch, Second Screen, Universal Cast, Remote Camera, XCore gaming) | **Roadmap** — see `ROADMAP.md` |
 
@@ -181,19 +226,44 @@ python3 lwos_continuity_daemon.py
 ```
 
 No dependencies beyond the Python 3 standard library — except for
-clipboard support, which needs `xclip` (preferred) or `xsel`:
+clipboard support (`xclip`/`xsel`) and Second Screen (`ffmpeg`, `adb`):
 
 ```bash
-sudo apt install xclip   # Linux Mint today; same package name on CachyOS via pacman: sudo pacman -S xclip
+# Linux Mint
+sudo apt install xclip ffmpeg android-tools-adb
+# CachyOS
+sudo pacman -S xclip ffmpeg android-tools
 ```
 
-It listens on `0.0.0.0:59213` (control channel) and `0.0.0.0:59214`
-(file transfer), prints every pairing/handoff/clipboard/notification
-it receives, and saves incoming files to `~/LWOSReceived/`.
+It listens on `0.0.0.0:59213` (control channel), `0.0.0.0:59214` (file
+transfer), and `0.0.0.0:59215` (Second Screen), prints every pairing/
+handoff/clipboard/notification it receives, and saves incoming files
+to `~/LWOSReceived/`.
 
 Find your PC's LAN IP (`ip addr`) and use **Add device manually** on
 the phone to type it in — mDNS advertising from the daemon isn't built
-yet, so this is the reliable way to connect today, hotspot or not.
+yet, so this is the reliable way to connect over Wi-Fi today, hotspot
+or not. (Second Screen doesn't need this step — it's reached over the
+USB cable instead, see below.)
+
+### Second Screen setup (one-time)
+
+1. On the phone: **Settings → About phone** → tap **Build number** 7
+   times → **Developer options** → enable **USB debugging**.
+2. Plug the phone into the PC with a USB cable.
+3. The first time, the phone shows an **"Allow USB debugging?"**
+   prompt — accept it (tick "always allow from this computer" to skip
+   it next time).
+4. Run the daemon as above. Within a few seconds it should log
+   `[adb] Wired transport ready for <device serial> (ports 59213, 59214, 59215)`
+   — that's `run_adb_reverse_loop` finding the phone and tunneling all
+   three ports automatically.
+5. On the phone, tap **Second Screen (USB)**.
+
+If it just shows "Connecting to PC…" and never goes further, check
+that `adb devices` on the PC lists the phone as `device` (not
+`unauthorized` — re-check the prompt on the phone) and that `ffmpeg`
+is actually installed.
 
 ## Suggested next steps, in order
 

@@ -21,6 +21,10 @@ What's implemented here:
   - Notification mirroring: prints incoming NOTIFICATION_MIRROR messages
   - Fast file transfer: a dedicated server on its own port that saves
     incoming files to ~/LWOSReceived/
+  - Second Screen (wired, mirror mode): captures this machine's X11
+    display with ffmpeg and streams H.264 to the phone over USB, via
+    `adb reverse` tunneling the same way scrcpy does. See
+    run_second_screen_server() and run_adb_reverse_loop() below.
 
 What's still a stub / known simplification, worth knowing before
 assuming something is broken instead of just not built yet:
@@ -35,25 +39,41 @@ assuming something is broken instead of just not built yet:
     helper below.
   - Nothing here sends a file FROM the PC; FileTransferClient-equivalent
     code doesn't exist yet on this side, only the receiving server.
+  - Second Screen is MIRROR only (a live duplicate of this screen), not
+    a true extended desktop you can drag windows onto — that needs a
+    virtual X11 output configured first, which is machine-specific
+    enough that it's a deliberate follow-up rather than guessed at here.
+    There's also no input (touch/mouse) going back from the phone yet.
 
 Run it with:
     python3 lwos_continuity_daemon.py
+
+Second Screen additionally needs ffmpeg and adb on this machine:
+    sudo apt install ffmpeg android-tools-adb     # Linux Mint
+    sudo pacman -S ffmpeg android-tools            # CachyOS
+and USB debugging enabled on the phone (Settings -> About phone -> tap
+"Build number" 7 times -> Developer options -> USB debugging), plus
+accepting the "Allow USB debugging?" prompt that appears on the phone
+the first time it's plugged into this machine.
 """
 
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import socketserver
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional
 
 CONTINUITY_PORT = 59213   # must match ContinuityServer.DEFAULT_PORT on the Android side
 FILE_TRANSFER_PORT = 59214  # must match FileTransferServer.DEFAULT_PORT on the Android side
+SECOND_SCREEN_PORT = 59215  # must match SecondScreenActivity.SERVER_PORT on the Android side
 DOWNLOAD_DIR = Path.home() / "LWOSReceived"
 
 # This machine's own identity on the continuity protocol. Using the
@@ -329,10 +349,178 @@ def run_file_transfer_server(port: int = FILE_TRANSFER_PORT) -> None:
             threading.Thread(target=handle_file_transfer_connection, args=(conn, addr), daemon=True).start()
 
 
+# --- Second Screen (wired, mirror mode) -------------------------------------
+#
+# Captures this machine's real X11 display with ffmpeg (x11grab) and
+# streams raw H.264 (Annex-B elementary stream, no container) straight
+# out over its own socket. Deliberately a RAW byte stream with just one
+# JSON header line first, same shape as the file-transfer protocol
+# above and for the same reason: once the video starts, nothing should
+# be re-parsing it as text.
+#
+# This is MIRROR, not an extended desktop: it captures whatever is
+# already on screen. A true second monitor you can drag windows onto
+# would mean first setting up a virtual X11 output (e.g. the
+# xf86-video-dummy driver) and pointing ffmpeg at THAT instead of the
+# real display — worth doing later, but it's an Xorg config change
+# specific to this machine's graphics setup, not something to guess at
+# from here. Swapping it in later only means changing DISPLAY below.
+
+def detect_display_resolution(display: str) -> tuple:
+    """
+    Asks xrandr what the current display's real resolution is, so the
+    phone decodes at the right size instead of a guessed default. Best
+    effort: falls back to 1280x720 if parsing fails for any reason
+    (unexpected xrandr output, no DISPLAY, headless box, etc.) rather
+    than crashing the whole daemon over a cosmetic detail.
+    """
+    fallback = (1280, 720)
+    try:
+        env = dict(os.environ)
+        env["DISPLAY"] = display
+        output = subprocess.run(
+            ["xrandr", "--current"], env=env, capture_output=True, text=True, timeout=3
+        ).stdout
+        # Look for the line marking the currently active mode, e.g.:
+        #   "   1920x1080     60.00*+  59.94"
+        match = re.search(r"(\d+)x(\d+)\s+[\d.]+\*", output)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    except Exception as e:
+        print(f"[second-screen] Could not detect resolution via xrandr, using {fallback}: {e}")
+    return fallback
+
+
+def handle_second_screen_connection(conn: socket.socket, display: str, framerate: int = 30) -> None:
+    width, height = detect_display_resolution(display)
+    header = json.dumps({"width": width, "height": height, "framerate": framerate}) + "\n"
+
+    env = dict(os.environ)
+    env["DISPLAY"] = display
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-f", "x11grab",
+        "-video_size", f"{width}x{height}",
+        "-framerate", str(framerate),
+        "-i", display,
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-profile:v", "baseline",   # widest MediaCodec hardware-decoder compatibility on Android
+        "-pix_fmt", "yuv420p",
+        "-g", str(framerate * 2),    # a fresh keyframe at least every 2s, so joining/recovery is fast
+        "-f", "h264",
+        "-",
+    ]
+
+    proc = None
+    try:
+        conn.sendall(header.encode("utf-8"))
+        proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+        print(f"[second-screen] Streaming {width}x{height}@{framerate} to connected device")
+        while True:
+            # read1(), not read(): plain read(n) on a BufferedReader blocks
+            # until it fills the full n bytes, which on a mostly-static
+            # desktop (low bitrate) can sit for seconds waiting to fill the
+            # buffer instead of forwarding each small chunk as it's encoded
+            # — exactly the wrong behavior for "live" video. read1() returns
+            # as soon as any data is available, same idea as the file
+            # transfer loop but tuned for a stream instead of a known size.
+            chunk = proc.stdout.read1(32768)
+            if not chunk:
+                break
+            conn.sendall(chunk)
+    except (OSError, BrokenPipeError) as e:
+        print(f"[second-screen] Stream ended: {e}")
+    finally:
+        if proc is not None:
+            proc.kill()
+            proc.wait()
+        conn.close()
+        print("[second-screen] Disconnected")
+
+
+def run_second_screen_server(port: int = SECOND_SCREEN_PORT, display: Optional[str] = None) -> None:
+    display = display or os.environ.get("DISPLAY", ":0")
+    if not shutil.which("ffmpeg"):
+        print("[second-screen] ffmpeg not installed — Second Screen won't work. Run: sudo apt install ffmpeg")
+        return
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("0.0.0.0", port))
+        server.listen(5)
+        print(f"LWOS Second Screen server listening on 0.0.0.0:{port} (capturing DISPLAY={display})")
+        while True:
+            conn, addr = server.accept()
+            threading.Thread(
+                target=handle_second_screen_connection, args=(conn, display), daemon=True
+            ).start()
+
+
+# --- adb reverse automation (the "wired" transport) --------------------------
+#
+# `adb reverse tcp:P tcp:P` makes the PHONE's own localhost:P forward
+# over the USB cable to THIS machine's port P — so once it's set up,
+# the Android app can just connect to 127.0.0.1 and actually be
+# talking to this daemon, no Wi-Fi/LAN involved and no custom USB
+# protocol code needed on either side. This loop (re-)applies that
+# tunnel for every connected, authorized device every few seconds, so
+# plugging in a cable "just works" without a manual adb command.
+
+REVERSED_PORTS = (CONTINUITY_PORT, FILE_TRANSFER_PORT, SECOND_SCREEN_PORT)
+
+
+def list_adb_device_serials() -> list:
+    try:
+        output = subprocess.run(
+            ["adb", "devices"], capture_output=True, text=True, timeout=3
+        ).stdout
+    except Exception:
+        return []
+    serials = []
+    for line in output.splitlines()[1:]:  # first line is just "List of devices attached"
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == "device":  # "device" = connected AND authorized
+            serials.append(parts[0])
+    return serials
+
+
+def run_adb_reverse_loop(poll_seconds: float = 3.0) -> None:
+    if not shutil.which("adb"):
+        print("[adb] adb not installed — wired/USB transport won't work. "
+              "Run: sudo apt install android-tools-adb")
+        return
+
+    already_reversed = set()
+    while True:
+        serials = list_adb_device_serials()
+        for serial in serials:
+            if serial in already_reversed:
+                continue
+            ok = True
+            for port in REVERSED_PORTS:
+                result = subprocess.run(
+                    ["adb", "-s", serial, "reverse", f"tcp:{port}", f"tcp:{port}"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode != 0:
+                    ok = False
+                    print(f"[adb] Could not set up reverse tcp:{port} for {serial}: {result.stderr.strip()}")
+            if ok:
+                already_reversed.add(serial)
+                print(f"[adb] Wired transport ready for {serial} (ports {', '.join(map(str, REVERSED_PORTS))})")
+        # Forget devices that got unplugged, so a reconnect re-applies cleanly.
+        already_reversed &= set(serials)
+        time.sleep(poll_seconds)
+
+
 # --- Entry point -------------------------------------------------------------
 
 def run(port: int = CONTINUITY_PORT) -> None:
     threading.Thread(target=run_file_transfer_server, daemon=True).start()
+    threading.Thread(target=run_second_screen_server, daemon=True).start()
+    threading.Thread(target=run_adb_reverse_loop, daemon=True).start()
 
     with ThreadingTCPServer(("0.0.0.0", port), ContinuityHandler) as server:
         print(f"LWOS continuity daemon ({LOCAL_DEVICE_NAME}) listening on 0.0.0.0:{port}")

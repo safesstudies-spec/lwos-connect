@@ -134,6 +134,15 @@ class MainActivity : AppCompatActivity() {
             service?.openNotificationAccessSettings()
                 ?: Toast.makeText(this, "Service not ready yet", Toast.LENGTH_SHORT).show()
         }
+        binding.secondScreenButton.setOnClickListener {
+            // No pairing/trust check here on purpose — this is the wired
+            // (USB/adb) transport, so physical cable access already is
+            // the trust boundary, same as it would be for any other
+            // adb-based tool. SecondScreenActivity always connects to
+            // 127.0.0.1, which only reaches the PC because of the
+            // daemon's adb-reverse tunnel.
+            startActivity(Intent(this, SecondScreenActivity::class.java))
+        }
 
         requestNeededPermissions()
     }

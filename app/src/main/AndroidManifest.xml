@@ -34,6 +34,20 @@
             </intent-filter>
         </activity>
 
+        <!--
+          Second Screen (wired, mirror mode). Its own Activity rather
+          than a dialog/fragment inside MainActivity because it needs a
+          real fullscreen Surface for MediaCodec to decode straight
+          onto, and its own lifecycle (start/stop the decoder with the
+          screen, not with the main app window).
+        -->
+        <activity
+            android:name=".ui.SecondScreenActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout"
+            android:screenOrientation="userLandscape"
+            android:theme="@style/Theme.LwosConnect" />
+
         <service
             android:name=".service.ContinuityService"
             android:exported="false"

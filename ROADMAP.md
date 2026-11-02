@@ -1,11 +1,15 @@
 # LWOS Connect Roadmap
 
 What's already real is covered in `README.md`: Continue On, mutual
-pairing, Universal Clipboard, Fast File Transfer, and Notification
-Mirroring (all phone/tablet → PC). This file is the honest technical
-plan for everything else Ari asked for, grouped the way he grouped
-them. Nothing here is built yet — this is architecture notes and
-prior art to work from, not a progress log.
+pairing, Universal Clipboard, Fast File Transfer, Notification
+Mirroring (all phone/tablet → PC), and Second Screen in wired mirror
+mode. This file is the honest technical plan for everything else Ari
+asked for, grouped the way he grouped them. Nothing here is built yet
+— this is architecture notes and prior art to work from, not a
+progress log. (Second Screen's remaining pieces — extended mode,
+wireless, input — are the one exception: they're listed below because
+they build on top of what's already real rather than starting from
+nothing.)
 
 A general note on prior art: almost everything below has a
 well-known open-source project that already solved some version of
@@ -126,19 +130,38 @@ byte 0) and a progress UI instead of a single "Sending…" status line.
 
 ### Flexible Second Screen (Wired & Wireless)
 
-Using a phone/tablet as an extra monitor.
+Using a phone/tablet as an extra monitor. **Wired mirror mode is now
+real** — see the README. What's left:
 
-- **Wireless** is a specific case of screen *streaming*, covered by
-  the "Universal Cast" item below — technically the same video
-  pipeline, just framed as "extend" instead of "mirror."
-- **Wired** (USB) is actually the easier path for low latency:
-  Android has no built-in "be a display over USB" mode for arbitrary
-  apps, but on the PC side, projects like **deskreen** and
-  **spacedesk** show the two realistic approaches — spacedesk ships a
-  real virtual-display driver on the PC and a receiver app on the
-  phone, which is the more "correct" architecture than screen-casting
-  a mirrored desktop, if LWOS Desktop ever wants a real virtual
-  output.
+- **True extended desktop** (drag a window onto the phone like a real
+  second monitor, instead of just seeing a duplicate of screen 1):
+  needs a virtual X11 output configured on the PC first — the
+  `xf86-video-dummy` driver is the standard way to get one, set up via
+  an Xorg config change (and a logout/restart to apply). Once that
+  exists as its own display (e.g. `:0.1` or a second head on `:0`),
+  the *exact same* daemon code already built just needs to point
+  ffmpeg's `-i` at that display instead of the real one — the video
+  pipeline, the `adb reverse` transport, and the Android decoder are
+  all already shared infrastructure at that point. This is flagged
+  separately from the video work specifically because it's an Xorg/
+  driver config task on Ari's exact graphics hardware (Intel integrated,
+  via the `modesetting` driver today), which isn't something to guess
+  at without being able to test on the real machine.
+  - **Prior art**: **spacedesk** is the cleanest existing reference —
+    it ships a real virtual-display driver on the PC plus a receiver
+    app on the phone, which is the more "correct" architecture than
+    screen-casting a mirrored desktop, for exactly this reason.
+- **Wireless mode**: same video pipeline (ffmpeg x11grab → H.264 →
+  MediaCodec), just reached over LAN instead of `adb reverse` — mostly
+  a matter of wiring `SecondScreenActivity` to connect to a paired
+  device's real discovered IP instead of the hardcoded `127.0.0.1`,
+  plus deciding whether to reuse the existing pairing/trust system
+  (USB skips it today since the cable itself is the trust boundary;
+  Wi-Fi can't make that same assumption).
+- **Touch/mouse input back to the PC**: this is really the
+  Multi-Control & Input Sharing item below, applied specifically to
+  the second-screen case (so you could actually interact with what's
+  mirrored, not just look at it).
 
 ### Universal Cast & Desktop Mode Mirroring
 
