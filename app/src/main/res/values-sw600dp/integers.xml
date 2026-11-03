@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Tablet: more screen room, so a bigger grid (3x3 = 9 slots). -->
+    <integer name="shortcut_grid_columns">3</integer>
+    <integer name="max_shortcuts">9</integer>
+</resources>

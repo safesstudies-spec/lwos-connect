@@ -242,6 +242,39 @@ def handle_notification_mirror(message: dict) -> None:
     print(f"[notification] ({from_name}) {app_label}: {summary}")
 
 
+# --- Shortcuts (Stream-Deck-style) -------------------------------------------
+#
+# Deliberately a free-form shell command, not a fixed menu of built-in
+# actions — "customizable" was the whole point. That generality is
+# exactly why this is trust-gated like everything else here: a
+# shortcut is effectively letting a paired device run any command it
+# wants on this machine. The trust store is the only thing standing
+# between "convenient" and "a remote shell", so don't weaken that
+# check without weighing what it's actually protecting.
+
+def handle_shortcut_trigger(message: dict) -> None:
+    device_id = message.get("deviceId", "")
+    if not trust_store.is_trusted(device_id):
+        print(f"[ignored] Shortcut trigger from untrusted device {device_id}")
+        return
+    label = message.get("shortcutLabel", "Shortcut")
+    command = message.get("shortcutCommand", "")
+    if not command:
+        return
+    from_name = known_device_names.get(device_id, device_id)
+    print(f"[shortcut] '{label}' from {from_name}: running `{command}`")
+    try:
+        proc = subprocess.Popen(command, shell=True)
+        # Reap in a background thread rather than ignoring the handle
+        # outright — over a long-running daemon, never waiting on
+        # finished shortcut processes lets them pile up as zombies.
+        # We don't care about the exit code, just that something
+        # eventually calls wait() on it.
+        threading.Thread(target=proc.wait, daemon=True).start()
+    except Exception as e:
+        print(f"[shortcut] Failed to run '{label}': {e}")
+
+
 # --- Continuity control channel (JSON-over-TCP) -----------------------------
 
 class ContinuityHandler(socketserver.StreamRequestHandler):
@@ -270,6 +303,8 @@ class ContinuityHandler(socketserver.StreamRequestHandler):
                 handle_clipboard_sync(message)
             elif msg_type == "NOTIFICATION_MIRROR":
                 handle_notification_mirror(message)
+            elif msg_type == "SHORTCUT_TRIGGER":
+                handle_shortcut_trigger(message)
             elif msg_type == "HEARTBEAT":
                 pass  # nothing to do yet
             else:

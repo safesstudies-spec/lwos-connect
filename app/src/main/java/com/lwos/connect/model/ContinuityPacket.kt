@@ -69,7 +69,18 @@ data class ContinuityMessage(
     // Present when type == NOTIFICATION_MIRROR
     val notifAppLabel: String? = null,
     val notifTitle: String? = null,
-    val notifText: String? = null
+    val notifText: String? = null,
+
+    // Present when type == SHORTCUT_TRIGGER. `shortcutCommand` is run
+    // verbatim as a shell command on the receiving device (see the
+    // daemon's handle_shortcut_trigger) — deliberately a free-form
+    // string, not a fixed enum of built-in actions, so shortcuts stay
+    // as customizable as Ari asked for (anything you could type into a
+    // terminal, a shortcut can launch). That generality is also why
+    // this is gated behind the SAME trust check as every other message
+    // type here: an untrusted device must never get to run a command.
+    val shortcutLabel: String? = null,
+    val shortcutCommand: String? = null
 ) {
     @Serializable
     enum class MessageType {
@@ -79,7 +90,8 @@ data class ContinuityMessage(
         PAIR_REQUEST,
         PAIR_RESPONSE,
         CLIPBOARD_SYNC,
-        NOTIFICATION_MIRROR
+        NOTIFICATION_MIRROR,
+        SHORTCUT_TRIGGER
     }
 
     companion object {
@@ -127,6 +139,14 @@ data class ContinuityMessage(
                 notifAppLabel = appLabel,
                 notifTitle = title,
                 notifText = text
+            )
+
+        fun shortcutTrigger(sourceDeviceId: String, label: String, command: String) =
+            ContinuityMessage(
+                type = MessageType.SHORTCUT_TRIGGER,
+                deviceId = sourceDeviceId,
+                shortcutLabel = label,
+                shortcutCommand = command
             )
     }
 }

@@ -143,6 +143,9 @@ class MainActivity : AppCompatActivity() {
             // daemon's adb-reverse tunnel.
             startActivity(Intent(this, SecondScreenActivity::class.java))
         }
+        binding.shortcutsButton.setOnClickListener {
+            startActivity(Intent(this, ShortcutsActivity::class.java))
+        }
 
         requestNeededPermissions()
     }

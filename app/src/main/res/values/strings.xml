@@ -17,4 +17,21 @@
     <string name="choose_device_dialog_title">Send to which device?</string>
     <string name="second_screen_usb">Second Screen (USB)</string>
     <string name="second_screen_adb_missing">Plug in via USB, enable USB debugging, and make sure the daemon is running on the PC with adb installed</string>
+
+    <string name="shortcuts_button">Shortcuts</string>
+    <string name="shortcuts_title">Shortcuts</string>
+    <string name="shortcuts_hint">Tap an empty slot to add a shortcut. Tap a configured one to fire it; long-press to edit or remove it.</string>
+    <string name="shortcuts_no_target">No target device chosen</string>
+    <string name="shortcuts_target">Target: %1$s</string>
+    <string name="shortcuts_change_target">Change</string>
+    <string name="shortcuts_pick_target_title">Shortcuts fire at which device?</string>
+    <string name="shortcuts_pick_target_first">Choose a target device first (tap \"Change\")</string>
+    <string name="shortcuts_fired">Sent \"%1$s\"</string>
+    <string name="shortcut_add_title">Add shortcut</string>
+    <string name="shortcut_edit_title">Edit shortcut</string>
+    <string name="shortcut_label_hint">Label (e.g. Firefox)</string>
+    <string name="shortcut_command_hint">Command to run on the PC (e.g. firefox)</string>
+    <string name="shortcut_save">Save</string>
+    <string name="shortcut_cancel">Cancel</string>
+    <string name="shortcut_remove">Remove</string>
 </resources>

@@ -235,6 +235,20 @@ class ContinuityService : Service() {
         broadcastToTrustedDevices(message)
     }
 
+    /**
+     * Fires one Shortcuts-grid button at [device]. Unlike clipboard/
+     * notifications (which fan out to every trusted device), a
+     * shortcut goes to exactly the one device the Shortcuts screen has
+     * selected as its target — see ShortcutStore.targetDeviceId.
+     */
+    fun sendShortcut(device: DiscoveredDevice, label: String, command: String) {
+        if (device.host == null || device.port == null) return // Bluetooth-only targets land here once that transport exists
+        scope.launch {
+            val message = ContinuityMessage.shortcutTrigger(localDeviceId(), label, command)
+            ContinuityClient.send(device.host, device.port, message)
+        }
+    }
+
     private fun broadcastToTrustedDevices(message: ContinuityMessage) {
         val targets = discoveredDevices.values.filter { it.isTrusted && it.host != null && it.port != null }
         if (targets.isEmpty()) return

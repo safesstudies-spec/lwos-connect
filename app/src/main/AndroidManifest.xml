@@ -48,6 +48,11 @@
             android:screenOrientation="userLandscape"
             android:theme="@style/Theme.LwosConnect" />
 
+        <activity
+            android:name=".ui.ShortcutsActivity"
+            android:exported="false"
+            android:theme="@style/Theme.LwosConnect" />
+
         <service
             android:name=".service.ContinuityService"
             android:exported="false"

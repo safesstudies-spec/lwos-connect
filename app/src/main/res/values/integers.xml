@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Shortcuts grid sizing. Phone default here (2x3 = 6 slots, per
+      Ari's spec); res/values-sw600dp/integers.xml overrides both for
+      tablets (sw600dp is the standard Android qualifier for "has at
+      least 600dp of width available" — the usual phone/tablet cutoff).
+    -->
+    <integer name="shortcut_grid_columns">2</integer>
+    <integer name="max_shortcuts">6</integer>
+</resources>
