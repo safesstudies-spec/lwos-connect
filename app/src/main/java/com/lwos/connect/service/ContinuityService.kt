@@ -1,9 +1,11 @@
 package com.lwos.connect.service
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.bluetooth.BluetoothManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
@@ -20,7 +22,10 @@ import com.lwos.connect.model.ContinuityPacket
 import com.lwos.connect.model.DeviceType
 import com.lwos.connect.model.DiscoveredDevice
 import com.lwos.connect.model.LinkType
+import com.lwos.connect.model.MessageOrigin
 import com.lwos.connect.model.TrustedDevice
+import com.lwos.connect.transport.BluetoothContinuityConnection
+import com.lwos.connect.transport.BluetoothContinuityServer
 import com.lwos.connect.transport.ContinuityClient
 import com.lwos.connect.transport.ContinuityServer
 import com.lwos.connect.transport.FileTransferClient
@@ -30,6 +35,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import java.io.IOException
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -53,8 +59,16 @@ class ContinuityService : Service() {
     private lateinit var trustStore: TrustStore
     private lateinit var continuityServer: ContinuityServer
     private lateinit var fileTransferServer: FileTransferServer
+    private lateinit var bluetoothContinuityServer: BluetoothContinuityServer
     private var lanDiscovery: LanDiscoveryManager? = null
     private var bluetoothDiscovery: BluetoothDiscoveryManager? = null
+
+    // Persistent Bluetooth control connections, keyed by remote MAC
+    // address — one per currently-connected Bluetooth peer, whether we
+    // accepted it (BluetoothContinuityServer) or initiated it ourselves
+    // (connectBluetooth). See BluetoothContinuityConnection for why
+    // Bluetooth gets persistent connections while LAN stays one-shot.
+    private val bluetoothConnections = mutableMapOf<String, BluetoothContinuityConnection>()
 
     // Simple in-memory view for the UI; a real app would expose this via
     // a StateFlow, kept as a plain list here to stay readable.
@@ -108,7 +122,13 @@ class ContinuityService : Service() {
         startForeground(NOTIFICATION_ID, buildNotification())
 
         continuityServer = ContinuityServer(ContinuityServer.DEFAULT_PORT) { message, fromHost ->
-            handleIncomingMessage(message, fromHost)
+            handleIncomingMessage(message, MessageOrigin.Lan(fromHost)) { reply ->
+                // Reply on a FRESH connection to the sender's own listening
+                // port — by the time we're handling this, they already
+                // closed the connection they used to reach us (every LAN
+                // message here is a short-lived connect/send/close).
+                scope.launch { ContinuityClient.send(fromHost, ContinuityServer.DEFAULT_PORT, reply) }
+            }
         }
         continuityServer.start()
 
@@ -116,6 +136,20 @@ class ContinuityService : Service() {
             onFileReceived?.invoke(fileName, sizeBytes, fromDeviceName)
         }
         fileTransferServer.start()
+
+        // Bluetooth is the third transport: same protocol/dispatch as
+        // LAN (handleIncomingMessage below doesn't care which transport
+        // a message arrived on), but over a persistent RFCOMM connection
+        // instead of TCP. Requires BLUETOOTH_CONNECT/ADVERTISE already
+        // granted, same precondition as bluetoothDiscovery below.
+        bluetoothContinuityServer = BluetoothContinuityServer(
+            context = this,
+            onConnectionEstablished = { connection -> bluetoothConnections[connection.remoteAddress] = connection },
+            onIncomingMessage = { message, address, reply ->
+                handleIncomingMessage(message, MessageOrigin.Bluetooth(address), reply)
+            }
+        )
+        bluetoothContinuityServer.start()
 
         lanDiscovery = LanDiscoveryManager(
             context = this,
@@ -147,6 +181,9 @@ class ContinuityService : Service() {
     override fun onDestroy() {
         continuityServer.stop()
         fileTransferServer.stop()
+        bluetoothContinuityServer.stop()
+        bluetoothConnections.values.toList().forEach { it.close() }
+        bluetoothConnections.clear()
         lanDiscovery?.stop()
         bluetoothDiscovery?.stopDiscovery()
         scope.coroutineContext[Job]?.cancel()
@@ -184,15 +221,20 @@ class ContinuityService : Service() {
     }
 
     fun pair(device: DiscoveredDevice, pairingCode: String) {
+        val request = ContinuityMessage.pairRequest(
+            deviceId = localDeviceId(),
+            deviceName = Build.MODEL ?: "LWOS Device",
+            deviceType = DeviceType.PHONE.name,
+            pairingCode = pairingCode
+        )
         scope.launch {
-            if (device.host == null || device.port == null) return@launch // need LAN for now
-            val request = ContinuityMessage.pairRequest(
-                deviceId = localDeviceId(),
-                deviceName = Build.MODEL ?: "LWOS Device",
-                deviceType = DeviceType.PHONE.name,
-                pairingCode = pairingCode
-            )
-            ContinuityClient.send(device.host, device.port, request)
+            if (device.host != null && device.port != null) {
+                ContinuityClient.send(device.host, device.port, request)
+            } else if (device.bluetoothAddress != null) {
+                kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    connectBluetooth(device)?.send(request)
+                }
+            }
         }
     }
 
@@ -242,19 +284,59 @@ class ContinuityService : Service() {
      * selected as its target — see ShortcutStore.targetDeviceId.
      */
     fun sendShortcut(device: DiscoveredDevice, label: String, command: String) {
-        if (device.host == null || device.port == null) return // Bluetooth-only targets land here once that transport exists
+        val message = ContinuityMessage.shortcutTrigger(localDeviceId(), label, command)
         scope.launch {
-            val message = ContinuityMessage.shortcutTrigger(localDeviceId(), label, command)
-            ContinuityClient.send(device.host, device.port, message)
+            if (device.host != null && device.port != null) {
+                ContinuityClient.send(device.host, device.port, message)
+            } else if (device.bluetoothAddress != null) {
+                kotlinx.coroutines.withContext(Dispatchers.IO) {
+                    connectBluetooth(device)?.send(message)
+                }
+            }
+        }
+    }
+
+    /**
+     * Opens (or reuses an already-open) persistent Bluetooth connection
+     * to [device]. The first time two devices connect this way, Android
+     * may show its own system Bluetooth pairing/bonding prompt — that's
+     * normal OS-level Bluetooth bonding, a precondition for the RFCOMM
+     * socket itself, separate from (and happening before) LWOS's own
+     * app-level PAIR_REQUEST/PAIR_RESPONSE trust handshake above. Call
+     * off the main thread — the underlying connect() call blocks.
+     */
+    @SuppressLint("MissingPermission") // caller guarantees BLUETOOTH_CONNECT is granted
+    private fun connectBluetooth(device: DiscoveredDevice): BluetoothContinuityConnection? {
+        val address = device.bluetoothAddress ?: return null
+        bluetoothConnections[address]?.let { return it }
+
+        val adapter = (getSystemService(BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter ?: return null
+        val remote = adapter.getRemoteDevice(address)
+        return try {
+            val connection = BluetoothContinuityConnection.connectTo(
+                remote,
+                onMessage = { message, reply -> handleIncomingMessage(message, MessageOrigin.Bluetooth(address), reply) },
+                onClosed = { addr -> bluetoothConnections.remove(addr) }
+            )
+            bluetoothConnections[address] = connection
+            connection
+        } catch (e: IOException) {
+            null
         }
     }
 
     private fun broadcastToTrustedDevices(message: ContinuityMessage) {
-        val targets = discoveredDevices.values.filter { it.isTrusted && it.host != null && it.port != null }
+        val targets = discoveredDevices.values.filter { it.isTrusted }
         if (targets.isEmpty()) return
         scope.launch {
             for (device in targets) {
-                ContinuityClient.send(device.host!!, device.port!!, message)
+                if (device.host != null && device.port != null) {
+                    ContinuityClient.send(device.host, device.port, message)
+                } else if (device.bluetoothAddress != null) {
+                    kotlinx.coroutines.withContext(Dispatchers.IO) {
+                        connectBluetooth(device)?.send(message)
+                    }
+                }
             }
         }
     }
@@ -283,7 +365,18 @@ class ContinuityService : Service() {
 
     // --- Internal ------------------------------------------------------------
 
-    private fun handleIncomingMessage(message: ContinuityMessage, fromHost: String) {
+    /**
+     * Handles one incoming message regardless of which of the three
+     * transports it arrived on — LAN, USB (which is just LAN over an
+     * adb-reverse tunnel, indistinguishable from this function's point
+     * of view), or Bluetooth. [origin] carries just enough about where
+     * it came from to re-key a stale device-list entry (see
+     * upgradeDeviceIdentity); [reply] sends something back the right
+     * way for whichever transport this is — a fresh LAN connection, or
+     * a write on an already-open Bluetooth socket — without this
+     * function needing to know or care which.
+     */
+    private fun handleIncomingMessage(message: ContinuityMessage, origin: MessageOrigin, reply: (ContinuityMessage) -> Unit) {
         when (message.type) {
             ContinuityMessage.MessageType.HANDOFF -> {
                 val packet = message.packet ?: return
@@ -306,22 +399,15 @@ class ContinuityService : Service() {
                 val deviceName = message.deviceName ?: deviceId
                 val deviceType = message.deviceType ?: DeviceType.PHONE.name
                 trustStore.trust(TrustedDevice(deviceId, deviceName, deviceType, System.currentTimeMillis()))
-                upgradeDeviceIdentity(fromHost, deviceId, deviceName, deviceType)
+                upgradeDeviceIdentity(origin, deviceId, deviceName, deviceType)
 
-                scope.launch {
-                    val response = ContinuityMessage.pairResponse(
-                        deviceId = localDeviceId(),
-                        deviceName = Build.MODEL ?: "LWOS Device",
-                        deviceType = DeviceType.PHONE.name,
-                        accepted = true
-                    )
-                    // Reply on a FRESH connection to the requester's own
-                    // listening port — by the time we're handling this,
-                    // the requester already closed the connection it used
-                    // to send PAIR_REQUEST (see ContinuityClient: every
-                    // message is a short-lived connect/send/close).
-                    ContinuityClient.send(fromHost, ContinuityServer.DEFAULT_PORT, response)
-                }
+                val response = ContinuityMessage.pairResponse(
+                    deviceId = localDeviceId(),
+                    deviceName = Build.MODEL ?: "LWOS Device",
+                    deviceType = DeviceType.PHONE.name,
+                    accepted = true
+                )
+                reply(response)
             }
 
             ContinuityMessage.MessageType.PAIR_RESPONSE -> {
@@ -330,7 +416,7 @@ class ContinuityService : Service() {
                 val deviceName = message.deviceName ?: deviceId
                 val deviceType = message.deviceType ?: DeviceType.PC.name
                 trustStore.trust(TrustedDevice(deviceId, deviceName, deviceType, System.currentTimeMillis()))
-                upgradeDeviceIdentity(fromHost, deviceId, deviceName, deviceType)
+                upgradeDeviceIdentity(origin, deviceId, deviceName, deviceType)
             }
 
             ContinuityMessage.MessageType.CLIPBOARD_SYNC -> {
@@ -358,38 +444,65 @@ class ContinuityService : Service() {
                 )
             }
 
+            ContinuityMessage.MessageType.SHORTCUT_TRIGGER -> {
+                // Shortcuts are phone/tablet -> PC only for this pass (see
+                // the daemon's handle_shortcut_trigger, which is where one
+                // actually gets acted on). Arbitrary shell execution isn't
+                // a meaningful concept to apply to an Android device the
+                // way it is a Linux desktop, so one landing here is a
+                // no-op rather than something worth building out further
+                // right now.
+            }
+
             else -> { /* heartbeat / acks: nothing to do yet */ }
         }
     }
 
     /**
      * Once we learn a peer's real, stable deviceId (from a pairing
-     * message), replace whatever temporary entry we had for its address
-     * — a manually-added "manual-host:port" entry, or a freshly
-     * discovered one — with a single entry keyed by that real id and
-     * marked trusted. Without this, a manually-added device would never
-     * visibly become "trusted" in the device list: the trust store would
-     * hold the real id, but the list entry would still be keyed by the
-     * fake manual id, so the isTrusted lookup would never match.
+     * message), replace whatever temporary entry we had for it — a
+     * manually-added "manual-host:port" entry, or a freshly discovered
+     * one — with a single entry keyed by that real id and marked
+     * trusted. Without this, a manually-added device would never
+     * visibly become "trusted" in the device list: the trust store
+     * would hold the real id, but the list entry would still be keyed
+     * by the fake manual id, so the isTrusted lookup would never match.
+     *
+     * [origin] decides how to recognize "the same peer we were already
+     * tracking" — by LAN host for a LAN/USB message, by Bluetooth
+     * address for one that arrived over Bluetooth, since those are the
+     * two different things a stale entry could have been keyed by.
      */
-    private fun upgradeDeviceIdentity(host: String, realDeviceId: String, realDeviceName: String, realDeviceTypeRaw: String) {
+    private fun upgradeDeviceIdentity(origin: MessageOrigin, realDeviceId: String, realDeviceName: String, realDeviceTypeRaw: String) {
         val realDeviceType = try {
             DeviceType.valueOf(realDeviceTypeRaw)
         } catch (e: IllegalArgumentException) {
             DeviceType.PC
         }
 
-        val staleEntry = discoveredDevices.entries.find { it.value.host == host && it.key != realDeviceId }
+        val staleEntry = when (origin) {
+            is MessageOrigin.Lan -> discoveredDevices.entries.find { it.value.host == origin.host && it.key != realDeviceId }
+            is MessageOrigin.Bluetooth -> discoveredDevices.entries.find { it.value.bluetoothAddress == origin.address && it.key != realDeviceId }
+        }
         if (staleEntry != null) discoveredDevices.remove(staleEntry.key)
 
-        val base = staleEntry?.value ?: DiscoveredDevice(
-            deviceId = realDeviceId,
-            deviceName = realDeviceName,
-            deviceType = realDeviceType,
-            linkType = LinkType.LAN,
-            host = host,
-            port = ContinuityServer.DEFAULT_PORT
-        )
+        val base = staleEntry?.value ?: when (origin) {
+            is MessageOrigin.Lan -> DiscoveredDevice(
+                deviceId = realDeviceId,
+                deviceName = realDeviceName,
+                deviceType = realDeviceType,
+                linkType = LinkType.LAN,
+                host = origin.host,
+                port = ContinuityServer.DEFAULT_PORT
+            )
+            is MessageOrigin.Bluetooth -> DiscoveredDevice(
+                deviceId = realDeviceId,
+                deviceName = realDeviceName,
+                deviceType = realDeviceType,
+                linkType = LinkType.BLUETOOTH,
+                bluetoothAddress = origin.address
+            )
+        }
 
         discoveredDevices[realDeviceId] = base.copy(
             deviceId = realDeviceId,
