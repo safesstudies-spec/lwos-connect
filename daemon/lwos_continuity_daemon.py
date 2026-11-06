@@ -25,6 +25,18 @@ What's implemented here:
     display with ffmpeg and streams H.264 to the phone over USB, via
     `adb reverse` tunneling the same way scrcpy does. See
     run_second_screen_server() and run_adb_reverse_loop() below.
+  - Bluetooth transport: a third way to reach this machine (alongside
+    LAN and USB/adb), for when a device isn't on the same Wi-Fi and
+    isn't plugged in. Same ContinuityMessage protocol as LAN — pairing,
+    clipboard, notifications, Shortcuts all work the same either way —
+    just a persistent RFCOMM socket instead of a short-lived TCP one.
+    See run_bluetooth_continuity_server() below. Needs PyBluez (not
+    stdlib); no-ops with a warning if it isn't installed.
+  - Shortcuts (Stream-Deck-style): runs an arbitrary shell command sent
+    from a paired phone/tablet, e.g. a "Firefox" button that launches
+    Firefox on this machine. See handle_shortcut_trigger() below —
+    trust-gated the same as everything else, since this is effectively
+    letting a paired device run commands here.
 
 What's still a stub / known simplification, worth knowing before
 assuming something is broken instead of just not built yet:
@@ -44,6 +56,13 @@ assuming something is broken instead of just not built yet:
     virtual X11 output configured first, which is machine-specific
     enough that it's a deliberate follow-up rather than guessed at here.
     There's also no input (touch/mouse) going back from the phone yet.
+    Second Screen over Bluetooth specifically isn't built yet either —
+    only the control channel (pairing/clipboard/notifications/shortcuts)
+    runs over Bluetooth so far.
+  - The Bluetooth transport is written against the documented PyBluez
+    API but hasn't been tested against a real phone — this sandbox has
+    no Bluetooth adapter. Worth a close look the first time it's tried
+    against actual hardware.
 
 Run it with:
     python3 lwos_continuity_daemon.py
@@ -55,6 +74,12 @@ and USB debugging enabled on the phone (Settings -> About phone -> tap
 "Build number" 7 times -> Developer options -> USB debugging), plus
 accepting the "Allow USB debugging?" prompt that appears on the phone
 the first time it's plugged into this machine.
+
+The Bluetooth transport additionally needs PyBluez:
+    sudo apt install bluetooth libbluetooth-dev && pip install --break-system-packages pybluez   # Linux Mint
+    sudo pacman -S python-pybluez                                                                  # CachyOS
+and this machine's Bluetooth adapter powered on and discoverable (most
+desktop environments: click the Bluetooth icon -> turn it on).
 """
 
 import json
@@ -69,12 +94,20 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 CONTINUITY_PORT = 59213   # must match ContinuityServer.DEFAULT_PORT on the Android side
 FILE_TRANSFER_PORT = 59214  # must match FileTransferServer.DEFAULT_PORT on the Android side
 SECOND_SCREEN_PORT = 59215  # must match SecondScreenActivity.SERVER_PORT on the Android side
 DOWNLOAD_DIR = Path.home() / "LWOSReceived"
+
+# Must match BluetoothContinuityConnection.SERVICE_UUID / SERVICE_NAME on the
+# Android side exactly — this is the SDP service record Android's
+# createRfcommSocketToServiceRecord() looks up to find the right RFCOMM
+# channel on this machine, standing in for a "port number" the way LAN
+# uses CONTINUITY_PORT.
+BLUETOOTH_CONTROL_UUID = "8ab9a0f4-9c0b-4a1e-9c7f-6e1f9b9a1a01"
+BLUETOOTH_SERVICE_NAME = "LWOSConnectControl"
 
 # This machine's own identity on the continuity protocol. Using the
 # hostname is a deliberate simplification — good enough to be stable
@@ -155,7 +188,7 @@ def handle_handoff(packet: dict) -> None:
 
 # --- Pairing (mutual) ------------------------------------------------------
 
-def handle_pair_request(message: dict, peer_host: str) -> None:
+def handle_pair_request(message: dict, reply: Callable[[dict], None]) -> None:
     device_id = message.get("deviceId", "")
     device_name = message.get("deviceName", device_id)
     code = message.get("pairingCode", "")
@@ -167,12 +200,18 @@ def handle_pair_request(message: dict, peer_host: str) -> None:
     trust_store.trust(device_id)
     known_device_names[device_id] = device_name
 
-    # Pairing only becomes MUTUAL if we proactively connect back out and
-    # send our own identity — the requester already closed the connection
-    # it used to reach us (every message here is connect/send/close, not
-    # a request that waits for a reply on the same socket). Skipping this
-    # step is exactly the bug that made pairing look broken on the
-    # Android side: one device would trust the other, but not vice versa.
+    # Pairing only becomes MUTUAL if we send our own identity back. How
+    # that actually happens depends on the transport, which is exactly
+    # why this takes a `reply` callback instead of doing the sending
+    # itself: over LAN, the requester already closed the connection it
+    # used to reach us (every LAN message is connect/send/close, not a
+    # request that waits for a reply on the same socket), so `reply`
+    # opens a brand new outbound connection back. Over Bluetooth, the
+    # RFCOMM socket is already open and bidirectional, so `reply` just
+    # writes straight back down it — see handle_bluetooth_connection.
+    # Skipping this step entirely is exactly the bug that made pairing
+    # look broken on the Android side: one device would trust the
+    # other, but not vice versa.
     response = {
         "type": "PAIR_RESPONSE",
         "deviceId": LOCAL_DEVICE_ID,
@@ -180,7 +219,7 @@ def handle_pair_request(message: dict, peer_host: str) -> None:
         "deviceType": LOCAL_DEVICE_TYPE,
         "accepted": True,
     }
-    send_message(peer_host, CONTINUITY_PORT, response)
+    reply(response)
 
 
 def handle_pair_response(message: dict) -> None:
@@ -275,11 +314,47 @@ def handle_shortcut_trigger(message: dict) -> None:
         print(f"[shortcut] Failed to run '{label}': {e}")
 
 
-# --- Continuity control channel (JSON-over-TCP) -----------------------------
+# --- Continuity control channel (shared dispatch, LAN and Bluetooth) --------
+#
+# One dispatch point for an incoming ContinuityMessage, used by both the
+# LAN handler (ContinuityHandler, below) and the Bluetooth handler
+# (handle_bluetooth_connection, further down) — same protocol, same
+# trust checks, same handlers either way; only how the message arrived,
+# and how a reply gets sent back, differs. `reply` is only ever used by
+# handle_pair_request (the one message type here that sends something
+# back) — mirrors ContinuityService.handleIncomingMessage on the Android
+# side, where every case receives a reply callback but only PAIR_REQUEST
+# actually calls it.
+
+def dispatch_continuity_message(message: dict, peer_label: str, reply: Callable[[dict], None]) -> None:
+    msg_type = message.get("type")
+    if msg_type == "HANDOFF":
+        packet = message.get("packet")
+        if packet:
+            handle_handoff(packet)
+    elif msg_type == "PAIR_REQUEST":
+        handle_pair_request(message, reply)
+    elif msg_type == "PAIR_RESPONSE":
+        handle_pair_response(message)
+    elif msg_type == "CLIPBOARD_SYNC":
+        handle_clipboard_sync(message)
+    elif msg_type == "NOTIFICATION_MIRROR":
+        handle_notification_mirror(message)
+    elif msg_type == "SHORTCUT_TRIGGER":
+        handle_shortcut_trigger(message)
+    elif msg_type == "HEARTBEAT":
+        pass  # nothing to do yet
+    else:
+        print(f"[info] Unhandled message type from {peer_label}: {msg_type}")
+
 
 class ContinuityHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         peer = self.client_address[0]
+
+        def reply(response: dict) -> None:
+            send_message(peer, CONTINUITY_PORT, response)
+
         for raw_line in self.rfile:
             line = raw_line.decode("utf-8").strip()
             if not line:
@@ -289,26 +364,7 @@ class ContinuityHandler(socketserver.StreamRequestHandler):
             except json.JSONDecodeError:
                 print(f"[warn] Dropped malformed message from {peer}: {line!r}")
                 continue
-
-            msg_type = message.get("type")
-            if msg_type == "HANDOFF":
-                packet = message.get("packet")
-                if packet:
-                    handle_handoff(packet)
-            elif msg_type == "PAIR_REQUEST":
-                handle_pair_request(message, peer)
-            elif msg_type == "PAIR_RESPONSE":
-                handle_pair_response(message)
-            elif msg_type == "CLIPBOARD_SYNC":
-                handle_clipboard_sync(message)
-            elif msg_type == "NOTIFICATION_MIRROR":
-                handle_notification_mirror(message)
-            elif msg_type == "SHORTCUT_TRIGGER":
-                handle_shortcut_trigger(message)
-            elif msg_type == "HEARTBEAT":
-                pass  # nothing to do yet
-            else:
-                print(f"[info] Unhandled message type from {peer}: {msg_type}")
+            dispatch_continuity_message(message, peer, reply)
 
 
 class ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -550,12 +606,114 @@ def run_adb_reverse_loop(poll_seconds: float = 3.0) -> None:
         time.sleep(poll_seconds)
 
 
+# --- Bluetooth transport (third way to connect, alongside LAN and USB) ------
+#
+# Unlike the LAN control channel (one short-lived connect/send/close
+# socket per message), a Bluetooth RFCOMM connection is kept open once
+# established — see BluetoothContinuityConnection.kt on the Android side
+# for the full reasoning (SDP lookup + channel setup is real overhead,
+# and Shortcuts are supposed to feel instant). So this isn't "accept a
+# connection, read one message, close" like handle_file_transfer_connection;
+# it's a persistent read loop, with `reply` writing straight back down
+# the same socket instead of opening a new one.
+#
+# Needs PyBluez (not in the Python standard library) specifically for
+# bluetooth.advertise_service() — registering an actual SDP record under
+# BLUETOOTH_CONTROL_UUID is what makes Android's
+# createRfcommSocketToServiceRecord() able to find this service at all.
+# Bare socket.AF_BLUETOOTH/BTPROTO_RFCOMM (stdlib, Linux-only) can open
+# an RFCOMM socket but doesn't register it with SDP, which would leave
+# Android with no way to discover which channel to connect to. Same
+# "optional dependency, degrade gracefully" pattern as ffmpeg/adb/xclip
+# above: if PyBluez isn't installed, this transport just logs and
+# no-ops rather than crashing the whole daemon.
+
+def handle_bluetooth_connection(client_sock, address: str) -> None:
+    print(f"[bluetooth] Connected: {address}")
+
+    def reply(response: dict) -> None:
+        try:
+            client_sock.send((json.dumps(response) + "\n").encode("utf-8"))
+        except OSError as e:
+            print(f"[bluetooth] Could not reply to {address}: {e}")
+
+    # Manual buffer-and-split instead of makefile()/a line reader: PyBluez's
+    # BluetoothSocket is a thin wrapper around the real RFCOMM file
+    # descriptor and doesn't reliably support the buffered-file-object
+    # protocol the LAN side gets for free from socketserver.StreamRequestHandler.
+    buffer = b""
+    try:
+        while True:
+            chunk = client_sock.recv(4096)
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                raw_line, buffer = buffer.split(b"\n", 1)
+                line = raw_line.decode("utf-8").strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    print(f"[warn] Dropped malformed Bluetooth message from {address}: {line!r}")
+                    continue
+                dispatch_continuity_message(message, address, reply)
+    except OSError as e:
+        print(f"[bluetooth] Connection to {address} ended: {e}")
+    finally:
+        client_sock.close()
+        print(f"[bluetooth] Disconnected: {address}")
+
+
+def run_bluetooth_continuity_server() -> None:
+    try:
+        import bluetooth  # PyBluez — optional, see module docstring
+    except ImportError:
+        print("[bluetooth] PyBluez not installed — Bluetooth transport won't work. "
+              "Run: sudo pacman -S python-pybluez   (CachyOS)   or:  "
+              "sudo apt install bluetooth libbluetooth-dev && "
+              "pip install --break-system-packages pybluez   (Linux Mint)")
+        return
+
+    try:
+        server_sock = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+        server_sock.bind(("", bluetooth.PORT_ANY))
+        server_sock.listen(1)
+        channel = server_sock.getsockname()[1]
+        bluetooth.advertise_service(
+            server_sock,
+            BLUETOOTH_SERVICE_NAME,
+            service_id=BLUETOOTH_CONTROL_UUID,
+            service_classes=[BLUETOOTH_CONTROL_UUID, bluetooth.SERIAL_PORT_CLASS],
+            profiles=[bluetooth.SERIAL_PORT_PROFILE],
+        )
+    except OSError as e:
+        print(f"[bluetooth] Could not start Bluetooth server — is a Bluetooth "
+              f"adapter present, powered on, and discoverable? {e}")
+        return
+
+    print(f"[bluetooth] LWOS continuity server listening on RFCOMM channel {channel}, "
+          f"advertised as '{BLUETOOTH_SERVICE_NAME}' ({BLUETOOTH_CONTROL_UUID})")
+    while True:
+        try:
+            client_sock, client_info = server_sock.accept()
+        except OSError as e:
+            print(f"[bluetooth] Accept loop ended: {e}")
+            break
+        address = client_info[0] if client_info else "unknown"
+        threading.Thread(
+            target=handle_bluetooth_connection, args=(client_sock, address), daemon=True
+        ).start()
+
+
 # --- Entry point -------------------------------------------------------------
 
 def run(port: int = CONTINUITY_PORT) -> None:
     threading.Thread(target=run_file_transfer_server, daemon=True).start()
     threading.Thread(target=run_second_screen_server, daemon=True).start()
     threading.Thread(target=run_adb_reverse_loop, daemon=True).start()
+    threading.Thread(target=run_bluetooth_continuity_server, daemon=True).start()
 
     with ThreadingTCPServer(("0.0.0.0", port), ContinuityHandler) as server:
         print(f"LWOS continuity daemon ({LOCAL_DEVICE_NAME}) listening on 0.0.0.0:{port}")
