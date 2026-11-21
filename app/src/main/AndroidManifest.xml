@@ -1,11 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- LAN discovery (NSD / mDNS) -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- Wi-Fi Direct (WifiDirectManager) -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <!-- Android 13+ (API 33+): replaces location as the runtime gate for
+         Wi-Fi Direct/nearby-device discovery. "neverForLocation" is
+         accurate here — this app never derives physical location from
+         peer scan results, only device identity. -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="33" />
+    <!-- Android 12/12L (API 31-32, the bottom of this app's minSdk)
+         predate NEARBY_WIFI_DEVICES; Wi-Fi Direct peer discovery there
+         still needs fine location instead. Dropped automatically on 33+
+         by maxSdkVersion. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"
+        android:maxSdkVersion="32" />
+    <!-- Not required: devices without Wi-Fi Direct hardware just see
+         WifiDirectManager no-op (same pattern as the Bluetooth adapter
+         null-check elsewhere in this app). -->
+    <uses-feature android:name="android.hardware.wifi.direct" android:required="false" />
 
     <!-- Bluetooth discovery (Android 12+ runtime-permission model) -->
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN"

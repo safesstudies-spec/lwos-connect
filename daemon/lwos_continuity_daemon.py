@@ -37,6 +37,11 @@ What's implemented here:
     Firefox on this machine. See handle_shortcut_trigger() below —
     trust-gated the same as everything else, since this is effectively
     letting a paired device run commands here.
+  - LAN auto-discovery: advertises this machine over mDNS (see
+    run_mdns_advertisement) so a phone that's paired once sees it again
+    automatically on the same Wi-Fi, instead of needing its IP re-typed
+    in every time. Needs `zeroconf` (not stdlib); no-ops with a warning
+    if it isn't installed.
 
 What's still a stub / known simplification, worth knowing before
 assuming something is broken instead of just not built yet:
@@ -80,6 +85,9 @@ The Bluetooth transport additionally needs PyBluez:
     sudo pacman -S python-pybluez                                                                  # CachyOS
 and this machine's Bluetooth adapter powered on and discoverable (most
 desktop environments: click the Bluetooth icon -> turn it on).
+
+LAN auto-discovery additionally needs zeroconf:
+    pip install --break-system-packages zeroconf   # Linux Mint and CachyOS both
 """
 
 import json
@@ -707,6 +715,93 @@ def run_bluetooth_continuity_server() -> None:
         ).start()
 
 
+# --- LAN auto-discovery (mDNS/Zeroconf advertising) --------------------------
+#
+# The Android app's LanDiscoveryManager already does continuous mDNS
+# discovery AND advertises itself — two phones can already find each
+# other on the same Wi-Fi automatically. What's been missing is THIS
+# machine: without advertising its own _lwosconnect._tcp service here,
+# a phone has no way to find the PC except by typing its IP into "Add
+# device manually" every single time. This is the fix — once this is
+# running, a phone that's already trusted this PC (paired once, by any
+# transport) sees it again automatically the moment they're on the same
+# Wi-Fi, the same way two phones already do.
+#
+# Needs the `zeroconf` package (not stdlib) — same optional-dependency,
+# graceful-fallback pattern as PyBluez/ffmpeg above. NOTE: this specific
+# function could not be run against a real `zeroconf` install in the
+# sandbox this was written in (outbound package installs were blocked
+# by network policy there), so double-check it against whatever
+# zeroconf version actually lands on this machine — see the README demo
+# steps for exactly what "it's working" should look like.
+
+def _get_local_lan_ip() -> Optional[str]:
+    """
+    Best-effort "what's this machine's LAN-facing IP" — the same
+    well-known trick used all over: opening a UDP "connection" to a
+    public address doesn't actually send a packet (UDP has no
+    handshake), it just asks the OS which local interface/IP it WOULD
+    use to reach that destination — which for a normal single-NIC
+    desktop on a home network is exactly the Wi-Fi/Ethernet IP a phone
+    needs to connect back to.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            return probe.getsockname()[0]
+    except OSError:
+        return None
+
+
+def run_mdns_advertisement() -> None:
+    try:
+        from zeroconf import Zeroconf, ServiceInfo  # optional, see section docstring above
+    except ImportError:
+        print("[mdns] zeroconf not installed — this machine won't be auto-discoverable "
+              "on the LAN; phones will need \"Add device manually\" with this machine's "
+              "IP instead. Run: pip install --break-system-packages zeroconf")
+        return
+
+    ip = _get_local_lan_ip()
+    if ip is None:
+        print("[mdns] Could not determine a LAN IP to advertise (is this machine "
+              "connected to a network?) — skipping LAN auto-discovery advertisement.")
+        return
+
+    # Must match LanDiscoveryManager.SERVICE_TYPE on the Android side
+    # exactly (modulo the trailing "local." domain, which NsdManager
+    # appends on its own and python-zeroconf expects spelled out).
+    service_type = "_lwosconnect._tcp.local."
+    info = ServiceInfo(
+        service_type,
+        f"{LOCAL_DEVICE_NAME}.{service_type}",
+        addresses=[socket.inet_aton(ip)],
+        port=CONTINUITY_PORT,
+        # Same two TXT-record keys LanDiscoveryManager.onServiceResolved
+        # reads off a resolved NsdServiceInfo — this is what lets a
+        # phone recognize "this is a PC, and specifically THIS PC" before
+        # it even opens a connection.
+        properties={"deviceId": LOCAL_DEVICE_ID, "deviceType": LOCAL_DEVICE_TYPE},
+    )
+
+    zc = Zeroconf()
+    try:
+        zc.register_service(info)
+    except Exception as e:  # noqa: BLE001 - zeroconf's own exception types aren't all OSError
+        print(f"[mdns] Could not register the LAN advertisement: {e}")
+        return
+
+    print(f"[mdns] Advertising as '{LOCAL_DEVICE_NAME}' ({service_type}) at "
+          f"{ip}:{CONTINUITY_PORT} — phones on this Wi-Fi can now auto-discover this "
+          f"machine instead of needing its IP typed in manually.")
+    # No explicit unregister on shutdown: this is a daemon thread that
+    # lives exactly as long as the process does, same simplification as
+    # the Bluetooth SDP advertisement above — when the process exits,
+    # the socket closes and the mDNS record simply times out on its own.
+    while True:
+        time.sleep(3600)
+
+
 # --- Entry point -------------------------------------------------------------
 
 def run(port: int = CONTINUITY_PORT) -> None:
@@ -714,6 +809,7 @@ def run(port: int = CONTINUITY_PORT) -> None:
     threading.Thread(target=run_second_screen_server, daemon=True).start()
     threading.Thread(target=run_adb_reverse_loop, daemon=True).start()
     threading.Thread(target=run_bluetooth_continuity_server, daemon=True).start()
+    threading.Thread(target=run_mdns_advertisement, daemon=True).start()
 
     with ThreadingTCPServer(("0.0.0.0", port), ContinuityHandler) as server:
         print(f"LWOS continuity daemon ({LOCAL_DEVICE_NAME}) listening on 0.0.0.0:{port}")

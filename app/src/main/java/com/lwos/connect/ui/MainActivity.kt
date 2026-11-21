@@ -179,6 +179,12 @@ class MainActivity : AppCompatActivity() {
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             needed += Manifest.permission.POST_NOTIFICATIONS
+            // Wi-Fi Direct peer discovery's runtime gate on 13+.
+            needed += Manifest.permission.NEARBY_WIFI_DEVICES
+        } else {
+            // 12/12L (API 31-32) predate NEARBY_WIFI_DEVICES; Wi-Fi Direct
+            // peer discovery there needs fine location instead.
+            needed += Manifest.permission.ACCESS_FINE_LOCATION
         }
 
         val missing = needed.filter {

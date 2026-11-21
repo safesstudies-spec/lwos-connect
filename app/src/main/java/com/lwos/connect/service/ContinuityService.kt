@@ -6,9 +6,13 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
@@ -17,6 +21,7 @@ import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import com.lwos.connect.discovery.BluetoothDiscoveryManager
 import com.lwos.connect.discovery.LanDiscoveryManager
+import com.lwos.connect.discovery.WifiDirectManager
 import com.lwos.connect.model.ContinuityMessage
 import com.lwos.connect.model.ContinuityPacket
 import com.lwos.connect.model.DeviceType
@@ -34,6 +39,7 @@ import com.lwos.connect.trust.TrustStore
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicLong
@@ -62,6 +68,8 @@ class ContinuityService : Service() {
     private lateinit var bluetoothContinuityServer: BluetoothContinuityServer
     private var lanDiscovery: LanDiscoveryManager? = null
     private var bluetoothDiscovery: BluetoothDiscoveryManager? = null
+    private var wifiDirectManager: WifiDirectManager? = null
+    private var usbStateReceiver: BroadcastReceiver? = null
 
     // Persistent Bluetooth control connections, keyed by remote MAC
     // address — one per currently-connected Bluetooth peer, whether we
@@ -170,6 +178,62 @@ class ContinuityService : Service() {
         bluetoothDiscovery = BluetoothDiscoveryManager(this) { device ->
             addOrUpdateDevice(device)
         }.also { it.startDiscovery() }
+
+        wifiDirectManager = WifiDirectManager(
+            context = this,
+            localDeviceId = localDeviceId(),
+            localDeviceName = Build.MODEL ?: "LWOS Device",
+            isDeviceTrusted = { deviceId -> trustStore.isTrusted(deviceId) },
+            onPeerReachable = { device -> addOrUpdateDevice(device) }
+        ).also { it.start() }
+
+        // USB: "remember and reconnect" for a trusted PC. `adb reverse`
+        // (see the daemon's run_adb_reverse_loop) tunnels 127.0.0.1
+        // straight to whichever PC is plugged in over the cable, so once
+        // that tunnel exists, a trusted PC is reachable at 127.0.0.1
+        // using the exact same LAN protocol/ports as Wi-Fi — no new wire
+        // format needed. The only new thing here is noticing "a USB
+        // cable just got plugged in" and, for every PC we already trust,
+        // optimistically surfacing it at 127.0.0.1 automatically instead
+        // of making the user retype it via "Add device manually" (which
+        // still works fine too, and is how a PC gets trusted over USB
+        // the very first time, before there's anything to remember yet).
+        usbStateReceiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (intent.action != UsbManager.ACTION_USB_STATE) return
+                val connected = intent.getBooleanExtra(UsbManager.USB_CONNECTED, false)
+                if (!connected) {
+                    // The tunnel is gone with the cable; drop anything we
+                    // were only reaching at 127.0.0.1 so the device list
+                    // stops offering a now-dead target.
+                    discoveredDevices.entries.removeAll { it.value.host == "127.0.0.1" }
+                    onDeviceListChanged?.invoke()
+                    return
+                }
+                scope.launch {
+                    // Give the PC's own adb-reverse poll loop (which checks
+                    // `adb devices` every few seconds, see run_adb_reverse_loop)
+                    // a moment to actually set the tunnel up before treating
+                    // 127.0.0.1 as reachable — best-effort, not a guarantee.
+                    delay(4000)
+                    trustStore.getTrustedDevices()
+                        .filter { it.deviceType == DeviceType.PC.name }
+                        .forEach { trusted ->
+                            addOrUpdateDevice(
+                                DiscoveredDevice(
+                                    deviceId = trusted.deviceId,
+                                    deviceName = trusted.deviceName,
+                                    deviceType = DeviceType.PC,
+                                    linkType = LinkType.LAN,
+                                    host = "127.0.0.1",
+                                    port = ContinuityServer.DEFAULT_PORT
+                                )
+                            )
+                        }
+                }
+            }
+        }
+        registerReceiver(usbStateReceiver, IntentFilter(UsbManager.ACTION_USB_STATE))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -186,6 +250,9 @@ class ContinuityService : Service() {
         bluetoothConnections.clear()
         lanDiscovery?.stop()
         bluetoothDiscovery?.stopDiscovery()
+        wifiDirectManager?.stop()
+        usbStateReceiver?.let { runCatching { unregisterReceiver(it) } }
+        usbStateReceiver = null
         scope.coroutineContext[Job]?.cancel()
         if (instance === this) instance = null
         super.onDestroy()

@@ -5,7 +5,12 @@ import kotlinx.serialization.Serializable
 /** How we currently know how to reach a device. */
 enum class LinkType {
     LAN,
-    BLUETOOTH
+    BLUETOOTH,
+    // Its own value purely for display ("via Wi-Fi Direct" vs "via
+    // Wi-Fi") — once a Wi-Fi Direct group forms, it's just an IP link
+    // like any other, so the wire protocol and host/port fields below
+    // are used exactly the same way as LAN. See WifiDirectManager.
+    WIFI_DIRECT
 }
 
 enum class DeviceType {

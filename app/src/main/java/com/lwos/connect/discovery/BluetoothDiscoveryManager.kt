@@ -23,6 +23,15 @@ import com.lwos.connect.model.LinkType
  * Needs BLUETOOTH_SCAN / BLUETOOTH_CONNECT granted at runtime on
  * Android 12+ (the caller is responsible for requesting these before
  * calling startDiscovery()).
+ *
+ * Classic Bluetooth discovery (`adapter.startDiscovery()`) only ever
+ * runs for about 12 seconds and then stops on its own — it is NOT a
+ * continuous scan. Calling it once at app/service startup (which is
+ * all this used to do) means a device that walks into range a minute
+ * later is simply never noticed. To actually "remember and reconnect
+ * when in range" the way Ari asked, this restarts discovery every time
+ * it finishes, for as long as this manager is running — see
+ * ACTION_DISCOVERY_FINISHED below.
  */
 class BluetoothDiscoveryManager(
     private val context: Context,
@@ -33,6 +42,7 @@ class BluetoothDiscoveryManager(
     }
 
     private var receiver: BroadcastReceiver? = null
+    @Volatile private var keepScanning = false
 
     @SuppressLint("MissingPermission") // caller guarantees permissions are granted
     fun startDiscovery(): Boolean {
@@ -42,40 +52,57 @@ class BluetoothDiscoveryManager(
             return false
         }
 
+        keepScanning = true
         receiver = object : BroadcastReceiver() {
+            @SuppressLint("MissingPermission")
             override fun onReceive(ctx: Context, intent: Intent) {
-                if (intent.action != BluetoothDevice.ACTION_FOUND) return
+                when (intent.action) {
+                    BluetoothDevice.ACTION_FOUND -> {
+                        val device: BluetoothDevice? =
+                            intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                        device ?: return
 
-                val device: BluetoothDevice? =
-                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
-                device ?: return
+                        // We only care about devices that already identify as
+                        // LWOS peers; everything else (headphones, random
+                        // nearby phones) is ignored. A real "LWOS" device
+                        // will set its Bluetooth name to start with this
+                        // prefix while advertising/pairing (see ContinuityService).
+                        val name = device.name ?: return
+                        if (!name.startsWith(LWOS_BT_NAME_PREFIX)) return
 
-                // We only care about devices that already identify as LWOS
-                // peers; everything else (headphones, random nearby phones)
-                // is ignored. A real "LWOS" device will set its Bluetooth
-                // name to start with this prefix while advertising/pairing
-                // (see ContinuityService).
-                val name = device.name ?: return
-                if (!name.startsWith(LWOS_BT_NAME_PREFIX)) return
+                        onDeviceFound(
+                            DiscoveredDevice(
+                                deviceId = device.address, // MAC acts as the id for BT-only sightings
+                                deviceName = name.removePrefix(LWOS_BT_NAME_PREFIX),
+                                deviceType = DeviceType.PHONE, // refined once paired/resolved over LAN
+                                linkType = LinkType.BLUETOOTH,
+                                bluetoothAddress = device.address
+                            )
+                        )
+                    }
 
-                onDeviceFound(
-                    DiscoveredDevice(
-                        deviceId = device.address, // MAC acts as the id for BT-only sightings
-                        deviceName = name.removePrefix(LWOS_BT_NAME_PREFIX),
-                        deviceType = DeviceType.PHONE, // refined once paired/resolved over LAN
-                        linkType = LinkType.BLUETOOTH,
-                        bluetoothAddress = device.address
-                    )
-                )
+                    BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
+                        // Classic BT discovery is a one-shot ~12s burst — this
+                        // is what turns it into "keep scanning until stopped".
+                        if (keepScanning && adapter.isEnabled) {
+                            adapter.startDiscovery()
+                        }
+                    }
+                }
             }
         }
 
-        context.registerReceiver(receiver, IntentFilter(BluetoothDevice.ACTION_FOUND))
+        val filter = IntentFilter().apply {
+            addAction(BluetoothDevice.ACTION_FOUND)
+            addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED)
+        }
+        context.registerReceiver(receiver, filter)
         return adapter.startDiscovery()
     }
 
     @SuppressLint("MissingPermission")
     fun stopDiscovery() {
+        keepScanning = false
         bluetoothAdapter?.cancelDiscovery()
         receiver?.let {
             runCatching { context.unregisterReceiver(it) }
