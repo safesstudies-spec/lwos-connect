@@ -6,13 +6,18 @@ pairing/trust, and handing off "what you're doing" from one device to
 another), this app now also has: **Universal Clipboard**, **Fast File
 Transfer**, **Notification Mirroring**, a proper **mutual pairing
 handshake** (the bug where pairing "did something" but nothing
-actually synced afterward — fixed, see below), and **Second Screen
+actually synced afterward — fixed, see below), **Second Screen
 (wired, mirror mode)** — turn the phone into a live USB-connected
-mirror of the PC's screen.
+mirror of the PC's screen — and **remember devices + auto-connect in
+range**, over Wi-Fi (mDNS), Bluetooth, Wi-Fi Direct, or USB, so a
+trusted PC/phone reappears on its own instead of needing to be
+re-added every time.
 See `ROADMAP.md` for the larger remaining features (Phone Call
 Movement, App/Storage Streaming, Multi-Control, Audio Switch,
 Universal Cast, Remote Camera, a true *extended* Second Screen, and
-the XCore gaming pillar).
+the XCore gaming pillar), and **`docs/DEMO_RUNBOOK.md`** for a
+step-by-step script to actually run all four of the latest demos on
+your real phone + Linux Mint laptop.
 
 Per your answers: this ships as a **separate app** for now (a future
 pass folds the always-on parts into the LWOS Mobile launcher/OS itself
@@ -167,6 +172,48 @@ X11 display), and for wireless mode (same video pipeline, just reached
 over Wi-Fi instead of `adb reverse`). There's also no touch/mouse input
 back to the PC yet — display only.
 
+### Remember devices + auto-connect in range
+
+Once two devices have paired, they shouldn't need "Add device
+manually" or a fresh Bluetooth scan every single time. Four
+independent paths, each reusing the exact same `ContinuityServer`/
+`ContinuityClient` wire protocol once a link exists — only *finding*
+the peer differs per transport:
+
+- **Wi-Fi (mDNS)** — the Android app already advertised/discovered
+  itself continuously over NSD for phone↔phone; the missing half was
+  the **desktop daemon never advertised itself**. Fixed via
+  `run_mdns_advertisement()` (needs the optional `zeroconf` package —
+  see install note below).
+- **Bluetooth** — `BluetoothAdapter.startDiscovery()` only actually
+  scans for about 12 seconds and then stops; `BluetoothDiscoveryManager`
+  now listens for `ACTION_DISCOVERY_FINISHED` and restarts itself in a
+  loop, so it keeps looking instead of giving up.
+- **USB** — `adb reverse` already tunnels this app's three ports from
+  the phone's `127.0.0.1` to whichever PC is plugged in (see Second
+  Screen above); the only new piece is noticing a cable just got
+  plugged in (`Intent.ACTION_POWER_CONNECTED`) and, for every
+  already-trusted PC, optimistically surfacing it at `127.0.0.1`
+  instead of making you retype its IP.
+- **Wi-Fi Direct** (`WifiDirectManager`) — a genuinely new transport
+  for when two devices are physically near each other but not on the
+  same Wi-Fi network at all (the gap Bluetooth already covers, at much
+  higher throughput once connected). Uses `WifiP2pManager`'s DNS-SD
+  service discovery — the Wi-Fi Direct equivalent of mDNS — to find
+  other LWOS devices, then connects automatically to ones already
+  trusted. **This is the single least-tested piece of this whole
+  project** — there's no way to exercise real Wi-Fi Direct group
+  negotiation without two physical radios nearby, which the build/test
+  environment for this change didn't have.
+
+```bash
+# on the PC, for Wi-Fi auto-discovery (optional — degrades gracefully without it)
+pip install --break-system-packages zeroconf
+```
+
+See `docs/DEMO_RUNBOOK.md` for how to actually test each of these four
+paths on real hardware.
+
 ## What's real vs. stubbed vs. roadmap
 
 | Piece | Status |
@@ -182,8 +229,11 @@ back to the PC yet — display only.
 | Notification Mirroring (phone/tablet → PC) | Real (text only) |
 | Second Screen — wired, mirror mode | Real |
 | `adb reverse` wired transport (auto-applied to all 3 ports) | Real |
+| Bluetooth discovery — keeps scanning instead of stopping after ~12s | Real |
+| USB auto-reconnect (trusted PC resurfaces at `127.0.0.1` on cable plug-in) | Real |
+| Wi-Fi Direct discovery + auto-connect to a trusted peer | Real, but **unverified on real hardware** — written against the documented `WifiP2pManager` API; no physical Wi-Fi Direct radios were available to test against |
+| mDNS advertising on desktop (so the PC reappears automatically over Wi-Fi) | Real, but **unverified at runtime** — needs the optional `zeroconf` package, which could not be installed in the build/test environment for this change (network policy blocked reaching pypi.org); falls back to "Add device manually" if it's missing |
 | Trust store on desktop daemon | **Stubbed** — in-memory, resets on restart |
-| mDNS advertising on desktop | **Not done** — use "Add device manually" with the PC's IP |
 | Pairing confirmation UX | **Stubbed** — fixed demo code (`482913`), auto-accepted, no generated code + explicit confirm dialog yet |
 | Clipboard/notifications/files **PC → phone** direction | **Not done** — current daemon can receive but has no equivalent of `ContinuityClient`/`FileTransferClient` to initiate a send back |
 | Second Screen — wireless mode | **Not done** — same video pipeline, needs a non-adb transport (LAN) wired in |
@@ -226,14 +276,21 @@ python3 lwos_continuity_daemon.py
 ```
 
 No dependencies beyond the Python 3 standard library — except for
-clipboard support (`xclip`/`xsel`) and Second Screen (`ffmpeg`, `adb`):
+clipboard support (`xclip`/`xsel`), Second Screen (`ffmpeg`, `adb`),
+Bluetooth transport (`pybluez`), and Wi-Fi auto-discovery (`zeroconf`):
 
 ```bash
 # Linux Mint
-sudo apt install xclip ffmpeg android-tools-adb
+sudo apt install xclip ffmpeg android-tools-adb bluetooth libbluetooth-dev
+pip install --break-system-packages pybluez zeroconf
 # CachyOS
-sudo pacman -S xclip ffmpeg android-tools
+sudo pacman -S xclip ffmpeg android-tools python-pybluez
+pip install --break-system-packages zeroconf
 ```
+
+Every one of these is optional and degrades gracefully — the daemon
+logs a clear warning and no-ops for whichever pieces aren't installed,
+rather than failing to start.
 
 It listens on `0.0.0.0:59213` (control channel), `0.0.0.0:59214` (file
 transfer), and `0.0.0.0:59215` (Second Screen), prints every pairing/
