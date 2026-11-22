@@ -12,7 +12,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
-import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Binder
 import android.os.Build
@@ -198,42 +197,61 @@ class ContinuityService : Service() {
         // of making the user retype it via "Add device manually" (which
         // still works fine too, and is how a PC gets trusted over USB
         // the very first time, before there's anything to remember yet).
+        //
+        // ACTION_POWER_CONNECTED/DISCONNECTED, not UsbManager.ACTION_USB_STATE
+        // — that one looks like the obvious choice but is a hidden/
+        // system-only constant, not part of the public SDK (it doesn't
+        // even compile). Power-connected is a public, documented proxy:
+        // it also fires for a plain USB charger with no data connection
+        // at all, but that's harmless here — we only ever add a
+        // *previously-trusted* PC's entry, and if nothing is really
+        // listening at 127.0.0.1 the next action to that device just
+        // fails quietly, same as any other unreachable entry.
         usbStateReceiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
-                if (intent.action != UsbManager.ACTION_USB_STATE) return
-                val connected = intent.getBooleanExtra(UsbManager.USB_CONNECTED, false)
-                if (!connected) {
-                    // The tunnel is gone with the cable; drop anything we
-                    // were only reaching at 127.0.0.1 so the device list
-                    // stops offering a now-dead target.
-                    discoveredDevices.entries.removeAll { it.value.host == "127.0.0.1" }
-                    onDeviceListChanged?.invoke()
-                    return
-                }
-                scope.launch {
-                    // Give the PC's own adb-reverse poll loop (which checks
-                    // `adb devices` every few seconds, see run_adb_reverse_loop)
-                    // a moment to actually set the tunnel up before treating
-                    // 127.0.0.1 as reachable — best-effort, not a guarantee.
-                    delay(4000)
-                    trustStore.getTrustedDevices()
-                        .filter { it.deviceType == DeviceType.PC.name }
-                        .forEach { trusted ->
-                            addOrUpdateDevice(
-                                DiscoveredDevice(
-                                    deviceId = trusted.deviceId,
-                                    deviceName = trusted.deviceName,
-                                    deviceType = DeviceType.PC,
-                                    linkType = LinkType.LAN,
-                                    host = "127.0.0.1",
-                                    port = ContinuityServer.DEFAULT_PORT
-                                )
-                            )
+                when (intent.action) {
+                    Intent.ACTION_POWER_DISCONNECTED -> {
+                        // The tunnel is gone with the cable; drop anything we
+                        // were only reaching at 127.0.0.1 so the device list
+                        // stops offering a now-dead target.
+                        discoveredDevices.entries.removeAll { it.value.host == "127.0.0.1" }
+                        onDeviceListChanged?.invoke()
+                    }
+
+                    Intent.ACTION_POWER_CONNECTED -> {
+                        scope.launch {
+                            // Give the PC's own adb-reverse poll loop (which
+                            // checks `adb devices` every few seconds, see
+                            // run_adb_reverse_loop) a moment to actually set
+                            // the tunnel up before treating 127.0.0.1 as
+                            // reachable — best-effort, not a guarantee.
+                            delay(4000)
+                            trustStore.getTrustedDevices()
+                                .filter { it.deviceType == DeviceType.PC.name }
+                                .forEach { trusted ->
+                                    addOrUpdateDevice(
+                                        DiscoveredDevice(
+                                            deviceId = trusted.deviceId,
+                                            deviceName = trusted.deviceName,
+                                            deviceType = DeviceType.PC,
+                                            linkType = LinkType.LAN,
+                                            host = "127.0.0.1",
+                                            port = ContinuityServer.DEFAULT_PORT
+                                        )
+                                    )
+                                }
                         }
+                    }
                 }
             }
         }
-        registerReceiver(usbStateReceiver, IntentFilter(UsbManager.ACTION_USB_STATE))
+        registerReceiver(
+            usbStateReceiver,
+            IntentFilter().apply {
+                addAction(Intent.ACTION_POWER_CONNECTED)
+                addAction(Intent.ACTION_POWER_DISCONNECTED)
+            }
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
